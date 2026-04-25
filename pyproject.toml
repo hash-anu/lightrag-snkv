@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lightrag-snkv"
+version = "0.1.0"
+description = "SNKV storage backends for LightRAG — embedded SQLite+HNSW replacing 4 separate systems"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+keywords = ["rag", "lightrag", "snkv", "vector-search", "knowledge-graph"]
+dependencies = [
+    "lightrag-hku>=1.3.0",
+    "snkv>=0.1.0",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+vector = ["snkv[vector]>=0.1.0"]
+bench = [
+    "snkv[vector]>=0.1.0",
+    "faiss-cpu>=1.7",
+    "pandas>=2.0",
+    "rich>=13.0",
+]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-timeout>=2.0",
+]
+all = [
+    "lightrag-snkv[vector,bench,test]",
+]
+
+[project.scripts]
+lightrag-snkv-bench = "bench.run_all:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["lightrag_snkv", "bench"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "integration: requires external services / LLM credentials",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

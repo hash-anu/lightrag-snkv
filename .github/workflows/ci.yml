@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install lightrag-snkv + test extras
+        run: |
+          pip install -e ".[vector,test]"
+          # Also install lightrag from the repo root if available
+          pip install -e "../LightRAG" || pip install lightrag-hku
+
+      - name: Run unit tests
+        run: pytest tests/ -v --timeout=60 --ignore=tests/integration --ignore=tests/correctness
+
+  integration:
+    name: Integration tests (smoke)
+    runs-on: ubuntu-latest
+    # Only run on push to main or when the label "integration" is present
+    if: github.ref == 'refs/heads/main'
+    needs: unit
+    env:
+      LIGHTRAG_RUN_INTEGRATION: "true"
+      # Inject secrets from repository settings
+      LLM_BINDING: ${{ secrets.LLM_BINDING || 'azure_openai' }}
+      LLM_MODEL: ${{ secrets.LLM_MODEL || 'gpt-4o-mini' }}
+      LLM_BINDING_HOST: ${{ secrets.LLM_BINDING_HOST }}
+      LLM_BINDING_API_KEY: ${{ secrets.LLM_BINDING_API_KEY }}
+      AZURE_OPENAI_API_VERSION: "2024-08-01-preview"
+      EMBEDDING_BINDING: ${{ secrets.EMBEDDING_BINDING || 'azure_openai' }}
+      EMBEDDING_MODEL: ${{ secrets.EMBEDDING_MODEL || 'text-embedding-3-large' }}
+      EMBEDDING_BINDING_HOST: ${{ secrets.EMBEDDING_BINDING_HOST }}
+      EMBEDDING_BINDING_API_KEY: ${{ secrets.EMBEDDING_BINDING_API_KEY }}
+      EMBEDDING_DIM: "3072"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deps
+        run: |
+          pip install -e ".[vector,test]"
+          pip install -e "../LightRAG" || pip install lightrag-hku
+
+      - name: Run integration smoke tests (SNKV only)
+        run: pytest tests/integration/test_lightrag_snkv.py -v --timeout=300
+
+  benchmark-smoke:
+    name: Benchmark smoke test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    needs: unit
+    env:
+      LIGHTRAG_RUN_INTEGRATION: "true"
+      LLM_BINDING: ${{ secrets.LLM_BINDING || 'azure_openai' }}
+      LLM_MODEL: ${{ secrets.LLM_MODEL || 'gpt-4o-mini' }}
+      LLM_BINDING_HOST: ${{ secrets.LLM_BINDING_HOST }}
+      LLM_BINDING_API_KEY: ${{ secrets.LLM_BINDING_API_KEY }}
+      AZURE_OPENAI_API_VERSION: "2024-08-01-preview"
+      EMBEDDING_BINDING: ${{ secrets.EMBEDDING_BINDING || 'azure_openai' }}
+      EMBEDDING_MODEL: ${{ secrets.EMBEDDING_MODEL || 'text-embedding-3-large' }}
+      EMBEDDING_BINDING_HOST: ${{ secrets.EMBEDDING_BINDING_HOST }}
+      EMBEDDING_BINDING_API_KEY: ${{ secrets.EMBEDDING_BINDING_API_KEY }}
+      EMBEDDING_DIM: "3072"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deps
+        run: |
+          pip install -e ".[vector,bench,test]"
+          pip install -e "../LightRAG" || pip install lightrag-hku
+
+      - name: Run benchmark smoke (3 queries, 1 warmup)
+        run: |
+          python -m bench.run_all \
+            --stacks snkv nano \
+            --queries 3 \
+            --warmup 1 \
+            --modes hybrid \
+            --context-only
