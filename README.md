@@ -245,3 +245,4 @@ same abstract methods it would call on any other backend.
 ## License
 
 Apache 2.0
+# lightrag-snkv
