@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lightrag-snkv"
-version = "0.1.0"
+version = "0.1.0"  # bump to 0.2.0, 1.0.0, etc. before each release
 description = "SNKV storage backends for LightRAG — two embedded SQLite files replace four separate storage systems"
 readme = "README.md"
 requires-python = ">=3.10"
