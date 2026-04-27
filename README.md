@@ -1,4 +1,4 @@
-# lightrag-snkv
+# lightrag-snkv [WIP]
 
 **Drop-in SNKV storage backend for [LightRAG](https://github.com/HKUDS/LightRAG).**
 
