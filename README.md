@@ -3,7 +3,7 @@
 **Drop-in SNKV storage backend for [LightRAG](https://github.com/HKUDS/LightRAG).**
 
 Replaces LightRAG's default file-based storage (JSON + NetworkX pickle) with two
-embedded SQLite files — no separate server, no network, no operational overhead.
+embedded SNKV files — no separate server, no network, no operational overhead.
 
 ```bash
 pip install lightrag-snkv[vector]
@@ -17,7 +17,7 @@ pip install lightrag-snkv[vector]
 pip install lightrag-snkv[vector]
     │
     ├── lightrag-hku      ← full LightRAG framework (HKUDS team)
-    ├── snkv              ← SQLite + HNSW engine
+    ├── snkv              ← snkv + HNSW engine
     ├── lightrag-snkv     ← this package (storage adapters only)
     └── numpy
 ```
@@ -159,10 +159,10 @@ for mode in ["local", "global", "hybrid", "naive", "mix"]:
 
 | | Default LightRAG | lightrag-snkv |
 |---|---|---|
-| KV storage | JSON files | SQLite column family |
+| KV storage | JSON files | SNKV column family |
 | Vector search | Custom numpy | HNSW (usearch) |
-| Graph storage | NetworkX pickle | SQLite column family |
-| Doc status | JSON files | SQLite column family |
+| Graph storage | NetworkX pickle | SNKV column family |
+| Doc status | JSON files | SNKV column family |
 | Files on disk | Many (one per namespace) | 2 `.db` files |
 | ACID transactions | No | Yes |
 | Fast restarts | Slow (pickle rebuild) | Yes (HNSW sidecar) |
@@ -230,10 +230,10 @@ python -m bench.run_all --stacks snkv nano --queries 20 --warmup 5
 ```
 LightRAG                lightrag-snkv              snkv
 ────────────────        ──────────────────         ──────────────────────
-BaseKVStorage      ←──  SNKVKVStorage         ──►  snkv.db (SQLite CFs)
+BaseKVStorage      ←──  SNKVKVStorage         ──►  snkv.db (snkv CFs)
 BaseVectorStorage  ←──  SNKVVectorStorage     ──►  snkv_vec.db + usearch
-BaseGraphStorage   ←──  SNKVGraphStorage      ──►  snkv.db (SQLite CFs)
-DocStatusStorage   ←──  SNKVDocStatusStorage  ──►  snkv.db (SQLite CFs)
+BaseGraphStorage   ←──  SNKVGraphStorage      ──►  snkv.db (snkv CFs)
+DocStatusStorage   ←──  SNKVDocStatusStorage  ──►  snkv.db (snkv CFs)
 ```
 
 `lightrag-snkv` implements LightRAG's storage interfaces using SNKV as the
