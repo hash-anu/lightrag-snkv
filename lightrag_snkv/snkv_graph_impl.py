@@ -7,6 +7,7 @@ Edge keys are canonicalised as min(src,tgt)||max(src,tgt) for undirected semanti
 from __future__ import annotations
 
 import asyncio
+import collections
 import difflib
 import json
 import os
@@ -133,16 +134,18 @@ class SNKVGraphStorage(BaseGraphStorage):
 
     async def delete_node(self, node_id: str) -> None:
         def _delete():
-            # Read neighbours before the transaction so we can cascade-clean them.
+            # Pre-load all adj before the transaction (same pattern as remove_nodes).
             neighbours = self._get_adj(node_id)
+            nb_adjs: dict[str, set[str]] = {
+                nb: set(self._get_adj(nb)) for nb in neighbours
+            }
+            for adj in nb_adjs.values():
+                adj.discard(node_id)
 
             self._shared.kv.begin(write=True)
             try:
-                # Remove this node from every neighbour's adj list and delete the edge.
-                for nb in neighbours:
-                    nb_adj = set(self._get_adj(nb))
-                    nb_adj.discard(node_id)
-                    self._set_adj(nb, list(nb_adj))
+                for nb, adj in nb_adjs.items():
+                    self._set_adj(nb, list(adj))
                     try:
                         self._edges_cf.delete(_edge_key(node_id, nb))
                     except NotFoundError:
@@ -516,13 +519,13 @@ class SNKVGraphStorage(BaseGraphStorage):
 
             visited_nodes: set[str] = set()
             visited_edges: set[tuple[str, str]] = set()
-            queue: list[tuple[str, int]] = [(s, 0) for s in seeds]
+            queue: collections.deque[tuple[str, int]] = collections.deque((s, 0) for s in seeds)
             is_truncated = False
             kg_nodes: list[KnowledgeGraphNode] = []
             kg_edges: list[KnowledgeGraphEdge] = []
 
             while queue:
-                node_id, depth = queue.pop(0)
+                node_id, depth = queue.popleft()
                 if node_id in visited_nodes:
                     continue
                 if len(visited_nodes) >= max_nodes:
