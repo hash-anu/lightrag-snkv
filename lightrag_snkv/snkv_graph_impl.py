@@ -97,25 +97,13 @@ class SNKVGraphStorage(BaseGraphStorage):
         return json.loads(raw.decode()) if raw is not None else []
 
     def _set_adj(self, node_id: str, neighbours: list[str]) -> None:
-        self._adj_cf.put(node_id.encode(), json.dumps(neighbours).encode())
-
-    def _add_to_adj(self, node_id: str, neighbour: str) -> None:
-        neighbours = self._get_adj(node_id)
-        if neighbour not in neighbours:
-            neighbours.append(neighbour)
-            self._set_adj(node_id, neighbours)
-
-    def _remove_from_adj(self, node_id: str, neighbour: str) -> None:
-        neighbours = self._get_adj(node_id)
-        if neighbour in neighbours:
-            neighbours.remove(neighbour)
-            if neighbours:
-                self._set_adj(node_id, neighbours)
-            else:
-                try:
-                    self._adj_cf.delete(node_id.encode())
-                except NotFoundError:
-                    pass
+        if neighbours:
+            self._adj_cf.put(node_id.encode(), json.dumps(neighbours).encode())
+        else:
+            try:
+                self._adj_cf.delete(node_id.encode())
+            except NotFoundError:
+                pass
 
     # ------------------------------------------------------------------
     # Node operations
@@ -145,14 +133,33 @@ class SNKVGraphStorage(BaseGraphStorage):
 
     async def delete_node(self, node_id: str) -> None:
         def _delete():
+            # Read neighbours before the transaction so we can cascade-clean them.
+            neighbours = self._get_adj(node_id)
+
+            self._shared.kv.begin(write=True)
             try:
-                self._nodes_cf.delete(node_id.encode())
-            except NotFoundError:
-                pass
-            try:
-                self._adj_cf.delete(node_id.encode())
-            except NotFoundError:
-                pass
+                # Remove this node from every neighbour's adj list and delete the edge.
+                for nb in neighbours:
+                    nb_adj = set(self._get_adj(nb))
+                    nb_adj.discard(node_id)
+                    self._set_adj(nb, list(nb_adj))
+                    try:
+                        self._edges_cf.delete(_edge_key(node_id, nb))
+                    except NotFoundError:
+                        pass
+                # Delete node's own adj entry and node record.
+                try:
+                    self._adj_cf.delete(node_id.encode())
+                except NotFoundError:
+                    pass
+                try:
+                    self._nodes_cf.delete(node_id.encode())
+                except NotFoundError:
+                    pass
+                self._shared.kv.commit()
+            except Exception:
+                self._shared.kv.rollback()
+                raise
 
         await self._ex().run_in_executor(self._shared.executor, _delete)
 
@@ -214,17 +221,46 @@ class SNKVGraphStorage(BaseGraphStorage):
 
         return await self._ex().run_in_executor(self._shared.executor, _get)
 
-    async def upsert_edge(self, source_node_id: str, target_node_id: str, edge_data: dict[str, str]) -> None:
+    async def upsert_edge(
+        self, source_node_id: str, target_node_id: str, edge_data: dict[str, str]
+    ) -> None:
         def _upsert():
-            key = _edge_key(source_node_id, target_node_id)
-            self._edges_cf.put(key, json.dumps(edge_data, ensure_ascii=False).encode())
-            self._add_to_adj(source_node_id, target_node_id)
-            self._add_to_adj(target_node_id, source_node_id)
+            # Pre-load adj so all reads happen before the write transaction.
+            src_adj = set(self._get_adj(source_node_id))
+            tgt_adj = set(self._get_adj(target_node_id))
+            src_adj.add(target_node_id)
+            tgt_adj.add(source_node_id)
+
+            self._shared.kv.begin(write=True)
+            try:
+                self._edges_cf.put(
+                    _edge_key(source_node_id, target_node_id),
+                    json.dumps(edge_data, ensure_ascii=False).encode(),
+                )
+                self._set_adj(source_node_id, list(src_adj))
+                self._set_adj(target_node_id, list(tgt_adj))
+                self._shared.kv.commit()
+            except Exception:
+                self._shared.kv.rollback()
+                raise
 
         await self._ex().run_in_executor(self._shared.executor, _upsert)
 
     async def upsert_edges_batch(self, edges: list[tuple[str, str, dict[str, str]]]) -> None:
         def _upsert_batch():
+            # Pre-load adj for all affected nodes in one pass before the transaction
+            # to avoid read-within-transaction isolation issues.
+            all_nodes: set[str] = set()
+            for src, tgt, _ in edges:
+                all_nodes.add(src)
+                all_nodes.add(tgt)
+            adj_map: dict[str, set[str]] = {
+                nid: set(self._get_adj(nid)) for nid in all_nodes
+            }
+            for src, tgt, _ in edges:
+                adj_map[src].add(tgt)
+                adj_map[tgt].add(src)
+
             self._shared.kv.begin(write=True)
             try:
                 for src, tgt, data in edges:
@@ -232,8 +268,8 @@ class SNKVGraphStorage(BaseGraphStorage):
                         _edge_key(src, tgt),
                         json.dumps(data, ensure_ascii=False).encode(),
                     )
-                    self._add_to_adj(src, tgt)
-                    self._add_to_adj(tgt, src)
+                for nid, neighbours in adj_map.items():
+                    self._set_adj(nid, list(neighbours))
                 self._shared.kv.commit()
             except Exception:
                 self._shared.kv.rollback()
@@ -243,17 +279,49 @@ class SNKVGraphStorage(BaseGraphStorage):
 
     async def remove_nodes(self, nodes: list[str]) -> None:
         def _remove():
+            nodes_set = set(nodes)
+
+            # Pre-collect adj for deleted nodes so we know which edges to delete
+            # and which external neighbours need their adj updated.
+            node_adj: dict[str, list[str]] = {nid: self._get_adj(nid) for nid in nodes}
+
+            # Find external neighbours and pre-load their adj lists.
+            external: set[str] = {
+                nb
+                for nid, nbs in node_adj.items()
+                for nb in nbs
+                if nb not in nodes_set
+            }
+            ext_adj: dict[str, set[str]] = {
+                nb: set(self._get_adj(nb)) for nb in external
+            }
+
+            # Apply removals in-memory.
+            for node_id in nodes:
+                for nb in node_adj[node_id]:
+                    if nb in ext_adj:
+                        ext_adj[nb].discard(node_id)
+
             self._shared.kv.begin(write=True)
             try:
                 for node_id in nodes:
-                    try:
-                        self._nodes_cf.delete(node_id.encode())
-                    except NotFoundError:
-                        pass
+                    # Delete all edges incident to this node.
+                    for nb in node_adj[node_id]:
+                        try:
+                            self._edges_cf.delete(_edge_key(node_id, nb))
+                        except NotFoundError:
+                            pass
                     try:
                         self._adj_cf.delete(node_id.encode())
                     except NotFoundError:
                         pass
+                    try:
+                        self._nodes_cf.delete(node_id.encode())
+                    except NotFoundError:
+                        pass
+                # Write updated adj for external neighbours.
+                for nb, neighbours in ext_adj.items():
+                    self._set_adj(nb, list(neighbours))
                 self._shared.kv.commit()
             except Exception:
                 self._shared.kv.rollback()
@@ -263,6 +331,18 @@ class SNKVGraphStorage(BaseGraphStorage):
 
     async def remove_edges(self, edges: list[tuple[str, str]]) -> None:
         def _remove():
+            # Pre-load adj for all affected nodes before the transaction.
+            all_nodes: set[str] = set()
+            for src, tgt in edges:
+                all_nodes.add(src)
+                all_nodes.add(tgt)
+            adj_map: dict[str, set[str]] = {
+                nid: set(self._get_adj(nid)) for nid in all_nodes
+            }
+            for src, tgt in edges:
+                adj_map[src].discard(tgt)
+                adj_map[tgt].discard(src)
+
             self._shared.kv.begin(write=True)
             try:
                 for src, tgt in edges:
@@ -270,8 +350,8 @@ class SNKVGraphStorage(BaseGraphStorage):
                         self._edges_cf.delete(_edge_key(src, tgt))
                     except NotFoundError:
                         pass
-                    self._remove_from_adj(src, tgt)
-                    self._remove_from_adj(tgt, src)
+                for nid, neighbours in adj_map.items():
+                    self._set_adj(nid, list(neighbours))
                 self._shared.kv.commit()
             except Exception:
                 self._shared.kv.rollback()
@@ -292,7 +372,9 @@ class SNKVGraphStorage(BaseGraphStorage):
 
         return await self._ex().run_in_executor(self._shared.executor, _get_batch)
 
-    async def get_nodes_edges_batch(self, node_ids: list[str]) -> dict[str, list[tuple[str, str]]]:
+    async def get_nodes_edges_batch(
+        self, node_ids: list[str]
+    ) -> dict[str, list[tuple[str, str]]]:
         def _get_batch():
             out: dict[str, list[tuple[str, str]]] = {}
             for nid in node_ids:
@@ -324,7 +406,9 @@ class SNKVGraphStorage(BaseGraphStorage):
 
         return await self._ex().run_in_executor(self._shared.executor, _deg_batch)
 
-    async def edge_degrees_batch(self, edge_pairs: list[tuple[str, str]]) -> dict[tuple[str, str], int]:
+    async def edge_degrees_batch(
+        self, edge_pairs: list[tuple[str, str]]
+    ) -> dict[tuple[str, str], int]:
         def _deg_batch():
             return {
                 (src, tgt): len(self._get_adj(src)) + len(self._get_adj(tgt))
@@ -413,7 +497,9 @@ class SNKVGraphStorage(BaseGraphStorage):
 
         return await self._ex().run_in_executor(self._shared.executor, _get)
 
-    async def get_knowledge_graph(self, node_label: str, max_depth: int = 3, max_nodes: int = 1000) -> KnowledgeGraph:
+    async def get_knowledge_graph(
+        self, node_label: str, max_depth: int = 3, max_nodes: int = 1000
+    ) -> KnowledgeGraph:
         def _bfs() -> KnowledgeGraph:
             if node_label == "*":
                 seeds: list[str] = []
