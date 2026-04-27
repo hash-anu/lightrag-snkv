@@ -1,6 +1,8 @@
 """Integration tests: LightRAG with all-SNKV backend.
 
-Run with a real LLM+embedding configured via env vars:
+Requires LLM + embedding credentials in environment.  See
+tests/integration/llm_env.py for supported configuration paths.
+
     LIGHTRAG_RUN_INTEGRATION=true pytest tests/integration/test_lightrag_snkv.py
 """
 from __future__ import annotations
@@ -21,19 +23,17 @@ class TestLightRAGSNKV(BaseLightRAGTest):
     async def _make_rag(self, working_dir: str):
         from lightrag import LightRAG
         from lightrag_snkv.register import register
+        from tests.integration.llm_env import get_llm_and_embed_funcs
 
         register()
+        llm_func, embed_func = get_llm_and_embed_funcs()
 
-        # Import LLM/embed from env config (same approach as the server)
-        from lightrag.api.lightrag_server import _get_llm_func, _get_embed_func
-
-        rag = LightRAG(
+        return LightRAG(
             working_dir=working_dir,
-            llm_model_func=_get_llm_func(),
-            embedding_func=_get_embed_func(),
+            llm_model_func=llm_func,
+            embedding_func=embed_func,
             kv_storage="SNKVKVStorage",
             vector_storage="SNKVVectorStorage",
             graph_storage="SNKVGraphStorage",
             doc_status_storage="SNKVDocStatusStorage",
         )
-        return rag

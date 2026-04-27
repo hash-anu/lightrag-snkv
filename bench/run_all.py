@@ -36,10 +36,9 @@ async def run_benchmark(cfg: BenchConfig) -> list[Measurement]:
     queries = load_queries(cfg.queries_path)
 
     # Resolve LLM / embed functions from environment
-    from lightrag.api.lightrag_server import _get_embed_func, _get_llm_func
+    from bench.llm_env import get_llm_and_embed_funcs
 
-    llm_func = _get_llm_func()
-    embed_func = _get_embed_func()
+    llm_func, embed_func = get_llm_and_embed_funcs()
 
     all_results: list[Measurement] = []
     index_times: dict[str, float] = {}

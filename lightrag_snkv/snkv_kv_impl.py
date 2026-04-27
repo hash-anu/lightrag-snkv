@@ -1,21 +1,21 @@
-"""SNKV-backed BaseKVStorage implementation for LightRAG.
+"""SNKV-backed BaseKVStorage for LightRAG.
 
-One shared ``snkv_kv.db`` file per working-dir/workspace; each LightRAG
-KV namespace gets its own SQLite column family inside that file.
+All KV namespaces share one ``snkv.db`` file (via snkv_shared) using
+one column family per namespace.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import os
-import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, final
 
 from lightrag.base import BaseKVStorage
 from lightrag.utils import logger
-from snkv import KVStore, NotFoundError
+from snkv import NotFoundError
+
+from . import snkv_shared
 
 
 @final
@@ -32,43 +32,12 @@ class SNKVKVStorage(BaseKVStorage):
             self.final_namespace = self.namespace
 
         os.makedirs(db_dir, exist_ok=True)
-        self._db_path = os.path.join(db_dir, "snkv_kv.db")
+        self._db_path = os.path.join(db_dir, "snkv.db")
         self._cf_name = self.namespace
-        # max_workers=1 guarantees thread-safety of the KVStore object
-        self._executor = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix=f"snkv_kv_{self.final_namespace}",
-        )
-        self._db: KVStore | None = None
+        self._shared: snkv_shared.SharedStore | None = None
         self._cf = None
 
-    # ------------------------------------------------------------------
-    # Sync helpers (run inside the executor thread)
-    # ------------------------------------------------------------------
-
-    def _open_db(self) -> None:
-        self._db = KVStore(self._db_path)
-        try:
-            self._cf = self._db.open_column_family(self._cf_name)
-        except NotFoundError:
-            self._cf = self._db.create_column_family(self._cf_name)
-
-    def _close_db(self) -> None:
-        if self._cf is not None:
-            try:
-                self._cf.close()
-            except Exception:
-                pass
-            self._cf = None
-        if self._db is not None:
-            try:
-                self._db.close()
-            except Exception:
-                pass
-            self._db = None
-
     def _ex(self):
-        """Return the running loop; helper for less verbosity."""
         return asyncio.get_running_loop()
 
     # ------------------------------------------------------------------
@@ -76,11 +45,31 @@ class SNKVKVStorage(BaseKVStorage):
     # ------------------------------------------------------------------
 
     async def initialize(self) -> None:
-        await self._ex().run_in_executor(self._executor, self._open_db)
+        self._shared = snkv_shared.acquire(self._db_path)
+
+        def _open():
+            try:
+                self._cf = self._shared.kv.open_column_family(self._cf_name)
+            except NotFoundError:
+                self._cf = self._shared.kv.create_column_family(self._cf_name)
+
+        await self._ex().run_in_executor(self._shared.executor, _open)
 
     async def finalize(self) -> None:
-        await self._ex().run_in_executor(self._executor, self._close_db)
-        self._executor.shutdown(wait=False)
+        if self._shared is None:
+            return
+
+        def _close():
+            if self._cf is not None:
+                try:
+                    self._cf.close()
+                except Exception:
+                    pass
+                self._cf = None
+
+        await self._ex().run_in_executor(self._shared.executor, _close)
+        snkv_shared.release(self._db_path)
+        self._shared = None
 
     # ------------------------------------------------------------------
     # BaseKVStorage abstract methods
@@ -91,7 +80,7 @@ class SNKVKVStorage(BaseKVStorage):
             raw = self._cf.get(id.encode())
             return json.loads(raw.decode()) if raw is not None else None
 
-        return await self._ex().run_in_executor(self._executor, _get)
+        return await self._ex().run_in_executor(self._shared.executor, _get)
 
     async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any] | None]:
         def _get_many():
@@ -101,68 +90,67 @@ class SNKVKVStorage(BaseKVStorage):
                 out.append(json.loads(raw.decode()) if raw is not None else None)
             return out
 
-        return await self._ex().run_in_executor(self._executor, _get_many)
+        return await self._ex().run_in_executor(self._shared.executor, _get_many)
 
     async def filter_keys(self, keys: set[str]) -> set[str]:
-        """Return keys that are NOT present in storage."""
         def _filter():
             return {k for k in keys if not self._cf.exists(k.encode())}
 
-        return await self._ex().run_in_executor(self._executor, _filter)
+        return await self._ex().run_in_executor(self._shared.executor, _filter)
 
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
         if not data:
             return
 
         def _upsert():
-            self._db.begin(write=True)
+            self._shared.kv.begin(write=True)
             try:
                 for key, val in data.items():
                     self._cf.put(key.encode(), json.dumps(val, ensure_ascii=False).encode())
-                self._db.commit()
+                self._shared.kv.commit()
             except Exception:
-                self._db.rollback()
+                self._shared.kv.rollback()
                 raise
 
-        await self._ex().run_in_executor(self._executor, _upsert)
+        await self._ex().run_in_executor(self._shared.executor, _upsert)
 
     async def delete(self, ids: list[str]) -> None:
         if not ids:
             return
 
         def _delete():
-            self._db.begin(write=True)
+            self._shared.kv.begin(write=True)
             try:
                 for doc_id in ids:
                     try:
                         self._cf.delete(doc_id.encode())
                     except NotFoundError:
                         pass
-                self._db.commit()
+                self._shared.kv.commit()
             except Exception:
-                self._db.rollback()
+                self._shared.kv.rollback()
                 raise
 
-        await self._ex().run_in_executor(self._executor, _delete)
+        await self._ex().run_in_executor(self._shared.executor, _delete)
 
     async def is_empty(self) -> bool:
         def _check():
             return self._cf.count() == 0
 
-        return await self._ex().run_in_executor(self._executor, _check)
+        return await self._ex().run_in_executor(self._shared.executor, _check)
 
     async def index_done_callback(self) -> None:
         def _sync():
-            self._db.sync()
+            self._shared.kv.sync()
 
-        await self._ex().run_in_executor(self._executor, _sync)
+        await self._ex().run_in_executor(self._shared.executor, _sync)
 
     async def drop(self) -> dict[str, str]:
         def _drop():
             self._cf.clear()
 
         try:
-            await self._ex().run_in_executor(self._executor, _drop)
+            await self._ex().run_in_executor(self._shared.executor, _drop)
             return {"status": "success", "message": "data dropped"}
         except Exception as e:
             logger.error(f"[{self.workspace}] Error dropping {self.namespace}: {e}")

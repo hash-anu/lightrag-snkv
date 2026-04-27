@@ -1,0 +1,40 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# SNKV runtime artifacts
+*.db
+*.db-shm
+*.db-wal
+*.usearch
+*.nid
+
+# Benchmark working directories and results
+bench/_bench_wd/
+bench/_results/
+bench/data/
+
+# LightRAG working directories created during tests
+rag_storage/
+**/rag_storage/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

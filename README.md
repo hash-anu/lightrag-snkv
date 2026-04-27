@@ -1,25 +1,30 @@
 # lightrag-snkv
 
-**SNKV storage backends for [LightRAG](https://github.com/HKUDS/LightRAG)** — one embedded SQLite file replaces four separate storage systems (KV, vector, graph, doc-status), eliminating network hops and operational overhead.
+**SNKV storage backends for [LightRAG](https://github.com/HKUDS/LightRAG)** — two embedded SQLite files replace four separate storage systems (KV, vector, graph, doc-status), eliminating network hops and operational overhead.
 
 ## Why SNKV?
 
-| | NanoVectorDB (default) | FAISS | SNKV |
-|---|---|---|---|
-| KV storage | JSON files | JSON files | SQLite CF |
-| Vector search | Custom numpy | HNSW (IVF) | HNSW (usearch) |
-| Graph storage | NetworkX pickle | NetworkX pickle | SQLite CF |
-| Doc status | JSON files | JSON files | SQLite CF |
-| Network required | ✗ | ✗ | ✗ |
-| Single file | ✗ | ✗ | ✓ |
-| ACID transactions | ✗ | ✗ | ✓ |
-| Cold-start | Fast | Fast | Fast (sidecar) |
+| | NanoVectorDB (default) | SNKV |
+|---|---|---|
+| KV storage | JSON files | SQLite column family |
+| Vector search | Custom numpy | HNSW (usearch) |
+| Graph storage | NetworkX pickle | SQLite column family |
+| Doc status | JSON files | SQLite column family |
+| Network required | ✗ | ✗ |
+| Single-directory DB | ✗ (many files) | ✓ (2 `.db` files) |
+| ACID transactions | ✗ | ✓ |
+| Fast restarts | Slow (pickle reload) | ✓ (HNSW sidecar) |
 
-SNKV stores everything in **one `.db` file** per working directory using SQLite column families. The HNSW index saves a `.usearch` sidecar on close so restarts skip the O(n·d) rebuild.
+SNKV uses **two SQLite files** per working directory:
 
-## Benchmark Results
+- `snkv.db` — KV namespaces, graph (nodes/edges/adj), and doc-status, each in its own column family
+- `snkv_vec.db` — all vector namespaces, each in five column families (values, raw vectors, index↔key maps, metadata)
 
-> Measured on: i7-12700K, 32 GB RAM, SSD — A Christmas Carol corpus (64 chunks, 341 entities), `only_need_context=True` to isolate pure storage latency.
+The HNSW index is kept in-memory and saved as a `.usearch` sidecar on close so restarts skip the O(n·d) rebuild.
+
+## Benchmark
+
+> Measured on i7-12700K, 32 GB RAM, SSD — A Christmas Carol corpus (64 chunks, 341 entities), `only_need_context=True` to isolate pure storage latency.
 
 ### Mode: `hybrid`
 
@@ -27,11 +32,10 @@ SNKV stores everything in **one `.db` file** per working directory using SQLite 
 |--------|-----|----------|---------|---------|---------|
 | snkv   | 20  | 62.1     | 58.3    | 98.4    | 112.7   |
 | nano   | 20  | 71.4     | 67.2    | 115.6   | 128.3   |
-| faiss  | 20  | 68.9     | 64.1    | 109.2   | 121.4   |
 
 **SNKV speedup vs nano (p50): 1.15×**
 
-*Results will vary; run the benchmark yourself to get numbers for your hardware.*
+*Results vary by hardware and corpus size. Run the benchmark yourself — see [Running Benchmarks](#running-benchmarks).*
 
 ## Installation
 
@@ -39,13 +43,7 @@ SNKV stores everything in **one `.db` file** per working directory using SQLite 
 pip install lightrag-snkv[vector]
 ```
 
-Or from source (edits both `lightrag-snkv` and the local `LightRAG` clone):
-
-```bash
-cd lightrag-snkv
-pip install -e ".[vector,test]"
-pip install -e "../LightRAG"   # local LightRAG copy
-```
+> **Requirements**: Python ≥ 3.10, [lightrag-hku](https://pypi.org/project/lightrag-hku/) ≥ 1.4.0
 
 ## Quick Start
 
@@ -54,10 +52,10 @@ import asyncio
 from lightrag import LightRAG, QueryParam
 from lightrag_snkv import register
 
-# 1. Register SNKV class names into LightRAG's storage registry
+# Register SNKV class names into LightRAG's storage registry
 register()
 
-# 2. Configure your LLM and embedding functions (same as normal LightRAG)
+# Configure your LLM and embedding functions (same as normal LightRAG)
 from lightrag.llm.openai import gpt_4o_mini_complete, openai_embed
 
 async def main():
@@ -80,13 +78,14 @@ async def main():
 asyncio.run(main())
 ```
 
-Or use the convenience helper:
+Or use the one-call convenience helper:
 
 ```python
+from lightrag import LightRAG
 from lightrag_snkv import register_with_lightrag
 
 rag = LightRAG(working_dir="./rag_storage", ...)
-register_with_lightrag(rag)   # sets all 4 storage backends + registers
+register_with_lightrag(rag)   # registers SNKV + sets all 4 backend names
 await rag.initialize_storages()
 ```
 
@@ -95,49 +94,67 @@ await rag.initialize_storages()
 ```
 lightrag-snkv/
 ├── lightrag_snkv/
-│   ├── snkv_kv_impl.py          # BaseKVStorage → snkv_kv.db (column families)
-│   ├── snkv_vector_impl.py      # BaseVectorStorage → snkv_vec_{ns}.db (VectorStore)
-│   ├── snkv_graph_impl.py       # BaseGraphStorage → snkv_graph.db (nodes/edges/adj CFs)
-│   ├── snkv_doc_status_impl.py  # DocStatusStorage → snkv_doc.db
-│   └── register.py              # One-call registration into LightRAG
+│   ├── snkv_shared.py           # Per-db singleton: one KVStore + executor, ref-counted
+│   ├── snkv_kv_impl.py          # BaseKVStorage  → snkv.db (one CF per namespace)
+│   ├── snkv_vector_impl.py      # BaseVectorStorage → snkv_vec.db + .usearch sidecar
+│   ├── snkv_graph_impl.py       # BaseGraphStorage → snkv.db (nodes/edges/adj CFs)
+│   ├── snkv_doc_status_impl.py  # DocStatusStorage → snkv.db (doc_status CF)
+│   └── register.py              # One-call registration into LightRAG's registry
 ├── tests/
 │   ├── conftest.py              # Shared fixtures (mock embedding, tmp_dir)
-│   ├── test_snkv_kv.py          # 13 unit tests
-│   ├── test_snkv_vector.py      # 12 unit tests
-│   ├── test_snkv_graph.py       # 14 unit tests
-│   ├── test_snkv_doc_status.py  # 7 unit tests
-│   ├── integration/             # End-to-end LightRAG tests (requires LLM)
-│   └── correctness/             # Answer quality + consistency checks
+│   ├── test_snkv_kv.py          # Unit tests — KV storage
+│   ├── test_snkv_vector.py      # Unit tests — vector storage
+│   ├── test_snkv_graph.py       # Unit tests — graph storage
+│   ├── test_snkv_doc_status.py  # Unit tests — doc-status storage
+│   ├── compat/
+│   │   └── test_lightrag_graph_compat.py  # LightRAG's own 6 graph tests, SNKV-backed
+│   └── integration/
+│       ├── base_lightrag_test.py          # Reusable insert/query/delete suite
+│       └── test_lightrag_snkv.py          # End-to-end SNKV stack (requires LLM creds)
 └── bench/
-    ├── config.py                # Benchmark configuration
-    ├── dataset.py               # Corpus + query loading
-    ├── stacks.py                # Stack factory functions
-    ├── measure.py               # Timed query helpers
-    ├── run_all.py               # CLI entrypoint
-    └── report.py                # Table + Markdown output
+    ├── config.py       # Benchmark configuration dataclass
+    ├── dataset.py      # Built-in corpus + query loading
+    ├── stacks.py       # LightRAG stack factory functions (snkv, nano, faiss)
+    ├── measure.py      # Timed query helpers
+    ├── run_all.py      # CLI entry point
+    └── report.py       # Table + Markdown report rendering
 ```
 
 ## Running Tests
 
 ```bash
-# Unit tests only (no LLM required)
-pytest tests/ --ignore=tests/integration --ignore=tests/correctness -v
+# Unit + compat tests (no LLM required)
+pytest tests/ --ignore=tests/integration -v
 
-# Integration + correctness (requires LLM credentials in env)
-LIGHTRAG_RUN_INTEGRATION=true pytest tests/
+# Integration tests (requires LLM credentials — see below)
+LIGHTRAG_RUN_INTEGRATION=true pytest tests/integration/test_lightrag_snkv.py -v
+```
 
-# With the LightRAG .env file:
-source .env && pytest tests/integration/ -v
+### LLM credentials for integration tests
+
+The integration test and benchmark use `lightrag-hku[api]` server helpers to
+resolve LLM/embedding from environment variables, with an OpenAI fallback:
+
+**Option A — server helpers (multi-backend):**
+```bash
+pip install "lightrag-hku[api]>=1.4.0"
+export LLM_BINDING=openai LLM_MODEL=gpt-4o-mini LLM_BINDING_API_KEY=sk-...
+export EMBEDDING_BINDING=openai EMBEDDING_MODEL=text-embedding-3-small EMBEDDING_DIM=1536 EMBEDDING_BINDING_API_KEY=sk-...
+```
+
+**Option B — direct OpenAI:**
+```bash
+export OPENAI_API_KEY=sk-...
 ```
 
 ## Running Benchmarks
 
 ```bash
-# Quick smoke (context-only, no LLM needed for storage benchmarks)
+# Context-only (no LLM call needed — isolates pure storage latency)
 python -m bench.run_all --stacks snkv nano --queries 10 --warmup 3 --context-only
 
-# Full benchmark
-python -m bench.run_all --stacks snkv nano faiss --queries 50 --warmup 5
+# Full end-to-end benchmark (requires LLM credentials)
+python -m bench.run_all --stacks snkv nano --queries 20 --warmup 5
 
 # Custom corpus
 python -m bench.run_all --stacks snkv nano \
@@ -145,12 +162,18 @@ python -m bench.run_all --stacks snkv nano \
   --queries-file path/to/queries.txt
 ```
 
+## Compatibility
+
+LightRAG's own graph storage test suite (6 tests from `tests/test_graph_storage.py`)
+runs against `SNKVGraphStorage` as part of the standard test suite via
+`tests/compat/test_lightrag_graph_compat.py` — all 6 pass.
+
 ## Design Notes
 
-- **One DB file per storage type**: `snkv_kv.db`, `snkv_graph.db`, `snkv_doc.db` (shared by all namespaces via SQLite column families); `snkv_vec_{namespace}.db` per vector namespace.
-- **Thread safety**: Each storage instance uses a `ThreadPoolExecutor(max_workers=1)` to serialize SNKV calls on a dedicated thread. All async methods use `run_in_executor`.
-- **HNSW sidecar**: VectorStore saves the usearch index to `{path}.usearch` on close, skipping O(n·d) rebuild on restart. Detects staleness via a `.nid` stamp file.
-- **Cosine convention**: SNKV uses cosine *distance* (0=identical). The vector impl converts to cosine *similarity* (1=identical) to match NanoVectorDB's behaviour and LightRAG's `cosine_better_than_threshold` filter.
+- **Shared singleton**: `snkv_shared.py` maintains one `KVStore` + one `ThreadPoolExecutor(max_workers=1)` per db file, reference-counted across all storage instances that share the same file. All I/O for each file is serialised through one thread.
+- **Two files**: `snkv.db` holds KV, graph, and doc-status column families. `snkv_vec.db` holds all vector namespaces. Column family names are prefixed to avoid collisions.
+- **HNSW sidecar**: The usearch index is kept in-memory. On `finalize()` it is saved to `snkv_vec.{namespace}.usearch` (+ a `.nid` stamp). On `initialize()` the sidecar is loaded if the stamp matches, skipping the O(n·d) rebuild.
+- **Cosine convention**: SNKV stores cosine *distance* (0 = identical). The vector impl converts to cosine *similarity* (1 = identical) to match LightRAG's `cosine_better_than_threshold` filter semantics.
 
 ## License
 

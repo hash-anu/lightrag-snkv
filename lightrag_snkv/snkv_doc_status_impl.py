@@ -1,20 +1,21 @@
-"""SNKV-backed DocStatusStorage implementation for LightRAG.
+"""SNKV-backed DocStatusStorage for LightRAG.
 
-One ``snkv_doc.db`` per working-dir/workspace with a single ``doc_status``
-column family.  DocProcessingStatus objects are stored as JSON.
+Shares ``snkv.db`` with KV and graph storage via snkv_shared.
+Single column family ``doc_status``.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import os
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from typing import Any, final
 
 from lightrag.base import DocProcessingStatus, DocStatus, DocStatusStorage
 from lightrag.utils import logger
-from snkv import KVStore, NotFoundError
+from snkv import NotFoundError
+
+from . import snkv_shared
 
 
 def _to_dict(obj: DocProcessingStatus) -> dict:
@@ -43,50 +44,9 @@ class SNKVDocStatusStorage(DocStatusStorage):
             self.final_namespace = self.namespace
 
         os.makedirs(db_dir, exist_ok=True)
-        self._db_path = os.path.join(db_dir, "snkv_doc.db")
-        self._cf_name = "doc_status"
-        self._executor = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix=f"snkv_doc_{self.final_namespace}",
-        )
-        self._db: KVStore | None = None
+        self._db_path = os.path.join(db_dir, "snkv.db")
+        self._shared: snkv_shared.SharedStore | None = None
         self._cf = None
-
-    # ------------------------------------------------------------------
-    # Sync helpers
-    # ------------------------------------------------------------------
-
-    def _open_db(self) -> None:
-        self._db = KVStore(self._db_path)
-        try:
-            self._cf = self._db.open_column_family(self._cf_name)
-        except NotFoundError:
-            self._cf = self._db.create_column_family(self._cf_name)
-
-    def _close_db(self) -> None:
-        if self._cf is not None:
-            try:
-                self._cf.close()
-            except Exception:
-                pass
-            self._cf = None
-        if self._db is not None:
-            try:
-                self._db.close()
-            except Exception:
-                pass
-            self._db = None
-
-    def _iter_all(self) -> list[tuple[str, DocProcessingStatus]]:
-        out: list[tuple[str, DocProcessingStatus]] = []
-        with self._cf.iterator() as it:
-            for key_b, val_b in it:
-                try:
-                    d = json.loads(val_b.decode())
-                    out.append((key_b.decode(), _from_dict(d)))
-                except Exception:
-                    pass
-        return out
 
     def _ex(self):
         return asyncio.get_running_loop()
@@ -96,11 +56,45 @@ class SNKVDocStatusStorage(DocStatusStorage):
     # ------------------------------------------------------------------
 
     async def initialize(self) -> None:
-        await self._ex().run_in_executor(self._executor, self._open_db)
+        self._shared = snkv_shared.acquire(self._db_path)
+
+        def _open():
+            try:
+                self._cf = self._shared.kv.open_column_family("doc_status")
+            except NotFoundError:
+                self._cf = self._shared.kv.create_column_family("doc_status")
+
+        await self._ex().run_in_executor(self._shared.executor, _open)
 
     async def finalize(self) -> None:
-        await self._ex().run_in_executor(self._executor, self._close_db)
-        self._executor.shutdown(wait=False)
+        if self._shared is None:
+            return
+
+        def _close():
+            if self._cf is not None:
+                try:
+                    self._cf.close()
+                except Exception:
+                    pass
+                self._cf = None
+
+        await self._ex().run_in_executor(self._shared.executor, _close)
+        snkv_shared.release(self._db_path)
+        self._shared = None
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _iter_all(self) -> list[tuple[str, DocProcessingStatus]]:
+        out: list[tuple[str, DocProcessingStatus]] = []
+        with self._cf.iterator() as it:
+            for key_b, val_b in it:
+                try:
+                    out.append((key_b.decode(), _from_dict(json.loads(val_b.decode()))))
+                except Exception:
+                    pass
+        return out
 
     # ------------------------------------------------------------------
     # BaseKVStorage abstract methods
@@ -111,7 +105,7 @@ class SNKVDocStatusStorage(DocStatusStorage):
             raw = self._cf.get(id.encode())
             return json.loads(raw.decode()) if raw is not None else None
 
-        return await self._ex().run_in_executor(self._executor, _get)
+        return await self._ex().run_in_executor(self._shared.executor, _get)
 
     async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any] | None]:
         def _get_many():
@@ -121,67 +115,67 @@ class SNKVDocStatusStorage(DocStatusStorage):
                 out.append(json.loads(raw.decode()) if raw is not None else None)
             return out
 
-        return await self._ex().run_in_executor(self._executor, _get_many)
+        return await self._ex().run_in_executor(self._shared.executor, _get_many)
 
     async def filter_keys(self, keys: set[str]) -> set[str]:
         def _filter():
             return {k for k in keys if not self._cf.exists(k.encode())}
 
-        return await self._ex().run_in_executor(self._executor, _filter)
+        return await self._ex().run_in_executor(self._shared.executor, _filter)
 
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
         if not data:
             return
 
         def _upsert():
-            self._db.begin(write=True)
+            self._shared.kv.begin(write=True)
             try:
                 for key, val in data.items():
                     self._cf.put(key.encode(), json.dumps(val, ensure_ascii=False).encode())
-                self._db.commit()
+                self._shared.kv.commit()
             except Exception:
-                self._db.rollback()
+                self._shared.kv.rollback()
                 raise
 
-        await self._ex().run_in_executor(self._executor, _upsert)
+        await self._ex().run_in_executor(self._shared.executor, _upsert)
 
     async def delete(self, ids: list[str]) -> None:
         if not ids:
             return
 
         def _delete():
-            self._db.begin(write=True)
+            self._shared.kv.begin(write=True)
             try:
                 for doc_id in ids:
                     try:
                         self._cf.delete(doc_id.encode())
                     except NotFoundError:
                         pass
-                self._db.commit()
+                self._shared.kv.commit()
             except Exception:
-                self._db.rollback()
+                self._shared.kv.rollback()
                 raise
 
-        await self._ex().run_in_executor(self._executor, _delete)
+        await self._ex().run_in_executor(self._shared.executor, _delete)
 
     async def is_empty(self) -> bool:
         def _check():
             return self._cf.count() == 0
 
-        return await self._ex().run_in_executor(self._executor, _check)
+        return await self._ex().run_in_executor(self._shared.executor, _check)
 
     async def index_done_callback(self) -> None:
         def _sync():
-            self._db.sync()
+            self._shared.kv.sync()
 
-        await self._ex().run_in_executor(self._executor, _sync)
+        await self._ex().run_in_executor(self._shared.executor, _sync)
 
     async def drop(self) -> dict[str, str]:
         def _drop():
             self._cf.clear()
 
         try:
-            await self._ex().run_in_executor(self._executor, _drop)
+            await self._ex().run_in_executor(self._shared.executor, _drop)
             return {"status": "success", "message": "data dropped"}
         except Exception as e:
             logger.error(f"[{self.workspace}] Error dropping doc_status: {e}")
@@ -199,48 +193,30 @@ class SNKVDocStatusStorage(DocStatusStorage):
                 counts[key] = counts.get(key, 0) + 1
             return counts
 
-        return await self._ex().run_in_executor(self._executor, _count)
+        return await self._ex().run_in_executor(self._shared.executor, _count)
 
     async def get_all_status_counts(self) -> dict[str, int]:
         return await self.get_status_counts()
 
-    async def get_docs_by_status(
-        self, status: DocStatus
-    ) -> dict[str, DocProcessingStatus]:
+    async def get_docs_by_status(self, status: DocStatus) -> dict[str, DocProcessingStatus]:
         def _filter():
-            return {
-                doc_id: doc
-                for doc_id, doc in self._iter_all()
-                if doc.status == status
-            }
+            return {i: d for i, d in self._iter_all() if d.status == status}
 
-        return await self._ex().run_in_executor(self._executor, _filter)
+        return await self._ex().run_in_executor(self._shared.executor, _filter)
 
-    async def get_docs_by_statuses(
-        self, statuses: list[DocStatus]
-    ) -> dict[str, DocProcessingStatus]:
+    async def get_docs_by_statuses(self, statuses: list[DocStatus]) -> dict[str, DocProcessingStatus]:
         status_set = set(statuses)
 
         def _filter():
-            return {
-                doc_id: doc
-                for doc_id, doc in self._iter_all()
-                if doc.status in status_set
-            }
+            return {i: d for i, d in self._iter_all() if d.status in status_set}
 
-        return await self._ex().run_in_executor(self._executor, _filter)
+        return await self._ex().run_in_executor(self._shared.executor, _filter)
 
-    async def get_docs_by_track_id(
-        self, track_id: str
-    ) -> dict[str, DocProcessingStatus]:
+    async def get_docs_by_track_id(self, track_id: str) -> dict[str, DocProcessingStatus]:
         def _filter():
-            return {
-                doc_id: doc
-                for doc_id, doc in self._iter_all()
-                if doc.track_id == track_id
-            }
+            return {i: d for i, d in self._iter_all() if d.track_id == track_id}
 
-        return await self._ex().run_in_executor(self._executor, _filter)
+        return await self._ex().run_in_executor(self._shared.executor, _filter)
 
     async def get_docs_paginated(
         self,
@@ -254,21 +230,16 @@ class SNKVDocStatusStorage(DocStatusStorage):
             all_docs = self._iter_all()
             if status_filter is not None:
                 all_docs = [(i, d) for i, d in all_docs if d.status == status_filter]
-
             reverse = sort_direction.lower() == "desc"
             if sort_field == "id":
                 all_docs.sort(key=lambda x: x[0], reverse=reverse)
             else:
-                all_docs.sort(
-                    key=lambda x: getattr(x[1], sort_field, ""),
-                    reverse=reverse,
-                )
-
+                all_docs.sort(key=lambda x: getattr(x[1], sort_field, ""), reverse=reverse)
             total = len(all_docs)
             start = (page - 1) * page_size
             return all_docs[start : start + page_size], total
 
-        return await self._ex().run_in_executor(self._executor, _paginate)
+        return await self._ex().run_in_executor(self._shared.executor, _paginate)
 
     async def get_doc_by_file_path(self, file_path: str) -> dict[str, Any] | None:
         def _find():
@@ -279,4 +250,4 @@ class SNKVDocStatusStorage(DocStatusStorage):
                     return d
             return None
 
-        return await self._ex().run_in_executor(self._executor, _find)
+        return await self._ex().run_in_executor(self._shared.executor, _find)
