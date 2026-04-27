@@ -12,14 +12,14 @@ license = { text = "Apache-2.0" }
 keywords = ["rag", "lightrag", "snkv", "vector-search", "knowledge-graph", "sqlite"]
 dependencies = [
     "lightrag-hku>=1.4.0",
-    "snkv>=0.1.0",
+    "snkv>=0.7.0",
     "numpy>=1.24",
 ]
 
 [project.optional-dependencies]
-vector = ["snkv[vector]>=0.1.0"]
+vector = ["snkv[vector]>=0.7.0"]
 bench = [
-    "snkv[vector]>=0.1.0",
+    "snkv[vector]>=0.7.0",
     "pandas>=2.0",
     "rich>=13.0",
 ]
