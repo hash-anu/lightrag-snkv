@@ -27,22 +27,43 @@ import os
 
 
 def get_llm_and_embed_funcs():
-    """Return *(llm_func, embed_func)* built from environment variables."""
+    """Return *(llm_func, embed_func)* built from environment variables.
+
+    Raises ``MissingCredentialsError`` (a subclass of RuntimeError) when the
+    selected binding requires an API key that is not set.  Callers that want
+    to skip gracefully (e.g. pytest fixtures) can catch that specific type.
+    """
     llm_binding   = os.environ.get("LLM_BINDING",        "openai").lower()
     embed_binding = os.environ.get("EMBEDDING_BINDING",  "openai").lower()
     llm_model     = os.environ.get("LLM_MODEL",          "gpt-4o-mini")
     embed_model   = os.environ.get("EMBEDDING_MODEL",    "text-embedding-3-small")
     embed_dim     = int(os.environ.get("EMBEDDING_DIM",  "1536"))
-    llm_host      = os.environ.get("LLM_BINDING_HOST")        or None
-    llm_api_key   = (os.environ.get("LLM_BINDING_API_KEY")    or
-                     os.environ.get("OPENAI_API_KEY"))         or None
-    embed_host    = os.environ.get("EMBEDDING_BINDING_HOST")   or None
+    llm_host      = os.environ.get("LLM_BINDING_HOST")          or None
+    llm_api_key   = (os.environ.get("LLM_BINDING_API_KEY")      or
+                     os.environ.get("OPENAI_API_KEY"))           or None
+    embed_host    = os.environ.get("EMBEDDING_BINDING_HOST")     or None
     embed_api_key = (os.environ.get("EMBEDDING_BINDING_API_KEY") or
-                     os.environ.get("OPENAI_API_KEY"))          or None
+                     os.environ.get("OPENAI_API_KEY"))           or None
+
+    # Fail fast — better than a cryptic 401 deep in the call stack.
+    if llm_binding in ("openai", "openai-ollama") and not llm_api_key and not llm_host:
+        raise MissingCredentialsError(
+            "OpenAI LLM needs OPENAI_API_KEY or LLM_BINDING_API_KEY. "
+            "Add the secret to GitHub → Settings → Secrets → Actions."
+        )
+    if embed_binding == "openai" and not embed_api_key and not embed_host:
+        raise MissingCredentialsError(
+            "OpenAI embedding needs OPENAI_API_KEY or EMBEDDING_BINDING_API_KEY. "
+            "Add the secret to GitHub → Settings → Secrets → Actions."
+        )
 
     llm_func   = _make_llm(llm_binding, llm_model, llm_host, llm_api_key)
     embed_func = _make_embed(embed_binding, embed_model, embed_dim, embed_host, embed_api_key)
     return llm_func, embed_func
+
+
+class MissingCredentialsError(RuntimeError):
+    """Raised when required API credentials are absent from the environment."""
 
 
 def _make_llm(binding: str, model: str, host: str | None, api_key: str | None):

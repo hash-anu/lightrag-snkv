@@ -41,7 +41,11 @@ class BaseLightRAGTest(ABC):
         os.makedirs(self._working_dir, exist_ok=True)
 
     async def _get_rag(self):
-        rag = await self._make_rag(self._working_dir)
+        from bench.llm_env import MissingCredentialsError
+        try:
+            rag = await self._make_rag(self._working_dir)
+        except MissingCredentialsError as exc:
+            pytest.skip(str(exc))
         await rag.initialize_storages()
         return rag
 

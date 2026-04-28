@@ -56,7 +56,18 @@ jobs:
       - name: Install dependencies
         run: pip install -e ".[vector,test]"
 
+      - name: Check for API credentials
+        id: check-creds
+        run: |
+          if [ -n "$OPENAI_API_KEY" ] || [ -n "$LLM_BINDING_API_KEY" ]; then
+            echo "has_creds=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_creds=false" >> $GITHUB_OUTPUT
+            echo "⚠️  No API credentials set — integration tests will be skipped."
+          fi
+
       - name: Run SNKV integration tests
+        if: steps.check-creds.outputs.has_creds == 'true'
         run: pytest tests/integration/test_lightrag_snkv.py -v --timeout=300
 
   benchmark-smoke:
@@ -88,7 +99,18 @@ jobs:
       - name: Install dependencies
         run: pip install -e ".[vector,bench,test]"
 
+      - name: Check for API credentials
+        id: check-creds
+        run: |
+          if [ -n "$OPENAI_API_KEY" ] || [ -n "$LLM_BINDING_API_KEY" ]; then
+            echo "has_creds=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_creds=false" >> $GITHUB_OUTPUT
+            echo "⚠️  No API credentials set — benchmark smoke test will be skipped."
+          fi
+
       - name: Run benchmark smoke (3 queries, 1 warmup, context-only)
+        if: steps.check-creds.outputs.has_creds == 'true'
         run: |
           python -m bench.run_all \
             --stacks snkv nano \
