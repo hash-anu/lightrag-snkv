@@ -30,7 +30,7 @@ jobs:
   integration:
     name: Integration tests (SNKV)
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    if: false  # disabled until OPENAI_API_KEY secret is configured
     needs: unit
     env:
       LIGHTRAG_RUN_INTEGRATION: "true"
@@ -73,7 +73,7 @@ jobs:
   benchmark-smoke:
     name: Benchmark smoke test
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    if: false  # disabled until OPENAI_API_KEY secret is configured
     needs: unit
     env:
       LIGHTRAG_RUN_INTEGRATION: "true"
