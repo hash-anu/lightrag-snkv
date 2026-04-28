@@ -1,46 +1,115 @@
-"""Load LLM and embedding functions from environment variables.
+"""Resolve LLM + embedding functions from environment variables.
 
-Tries the LightRAG server helpers first (requires ``lightrag-hku[api]``
-which reads LLM_BINDING / EMBEDDING_BINDING etc.).  Falls back to a
-direct OpenAI setup when ``OPENAI_API_KEY`` is set and the api extra is
-absent.
+Builds functions directly — never imports lightrag.api.lightrag_server,
+which calls argparse at module import time and crashes under pytest/bench argv.
+
+Supported bindings
+------------------
+LLM_BINDING      : openai (default), openai-ollama, ollama
+EMBEDDING_BINDING: openai (default), ollama
+
+Environment variables
+---------------------
+LLM_BINDING              backend for LLM (default: openai)
+LLM_MODEL                model name (default: gpt-4o-mini)
+LLM_BINDING_HOST         optional base URL override
+LLM_BINDING_API_KEY      API key (falls back to OPENAI_API_KEY)
+EMBEDDING_BINDING        backend for embeddings (default: openai)
+EMBEDDING_MODEL          model name (default: text-embedding-3-small)
+EMBEDDING_DIM            vector dimension (default: 1536)
+EMBEDDING_BINDING_HOST   optional base URL override
+EMBEDDING_BINDING_API_KEY API key (falls back to OPENAI_API_KEY)
+OPENAI_API_KEY           standard OpenAI key — fallback for both sides
 """
 from __future__ import annotations
 
 import os
 
 
-def _try_server_helpers():
-    try:
-        from lightrag.api.lightrag_server import _get_embed_func, _get_llm_func
-        return _get_llm_func(), _get_embed_func()
-    except (ImportError, Exception):
-        return None, None
-
-
 def get_llm_and_embed_funcs():
-    """Return *(llm_func, embed_func)* configured from environment variables.
+    """Return *(llm_func, embed_func)* built from environment variables."""
+    llm_binding   = os.environ.get("LLM_BINDING",        "openai").lower()
+    embed_binding = os.environ.get("EMBEDDING_BINDING",  "openai").lower()
+    llm_model     = os.environ.get("LLM_MODEL",          "gpt-4o-mini")
+    embed_model   = os.environ.get("EMBEDDING_MODEL",    "text-embedding-3-small")
+    embed_dim     = int(os.environ.get("EMBEDDING_DIM",  "1536"))
+    llm_host      = os.environ.get("LLM_BINDING_HOST")        or None
+    llm_api_key   = (os.environ.get("LLM_BINDING_API_KEY")    or
+                     os.environ.get("OPENAI_API_KEY"))         or None
+    embed_host    = os.environ.get("EMBEDDING_BINDING_HOST")   or None
+    embed_api_key = (os.environ.get("EMBEDDING_BINDING_API_KEY") or
+                     os.environ.get("OPENAI_API_KEY"))          or None
 
-    **Server-helper path** (preferred, multi-backend):
-        Install ``lightrag-hku[api]`` and set:
-        ``LLM_BINDING``, ``LLM_MODEL``, ``LLM_BINDING_HOST``, ``LLM_BINDING_API_KEY``
-        ``EMBEDDING_BINDING``, ``EMBEDDING_MODEL``, ``EMBEDDING_DIM``
+    llm_func   = _make_llm(llm_binding, llm_model, llm_host, llm_api_key)
+    embed_func = _make_embed(embed_binding, embed_model, embed_dim, embed_host, embed_api_key)
+    return llm_func, embed_func
 
-    **OpenAI fallback** (when api extra is not installed):
-        Set ``OPENAI_API_KEY``.
-    """
-    llm_func, embed_func = _try_server_helpers()
-    if llm_func is not None:
-        return llm_func, embed_func
 
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "Cannot configure LLM/embed functions. Either:\n"
-            "  1. pip install 'lightrag-hku[api]' and set LLM_BINDING/EMBEDDING_BINDING, or\n"
-            "  2. Set OPENAI_API_KEY for the default OpenAI backend."
-        )
+def _make_llm(binding: str, model: str, host: str | None, api_key: str | None):
+    if binding in ("openai", "openai-ollama"):
+        from lightrag.llm.openai import openai_complete_if_cache
 
-    from lightrag.llm.openai import gpt_4o_mini_complete, openai_embed
+        _kw: dict = {}
+        if host:
+            _kw["base_url"] = host
+        if api_key:
+            _kw["api_key"] = api_key
 
-    return gpt_4o_mini_complete, openai_embed
+        async def _llm(prompt, system_prompt=None, history_messages=[], **kw):
+            return await openai_complete_if_cache(
+                model, prompt,
+                system_prompt=system_prompt,
+                history_messages=history_messages,
+                **_kw, **kw,
+            )
+        return _llm
+
+    if binding == "ollama":
+        from lightrag.llm.ollama import ollama_model_complete
+        _host = host or "http://localhost:11434"
+
+        async def _llm(prompt, system_prompt=None, history_messages=[], **kw):
+            return await ollama_model_complete(
+                model, prompt,
+                system_prompt=system_prompt,
+                history_messages=history_messages,
+                host=_host, **kw,
+            )
+        return _llm
+
+    raise RuntimeError(
+        f"Unsupported LLM_BINDING={binding!r}. "
+        "Supported: openai, openai-ollama, ollama"
+    )
+
+
+def _make_embed(binding: str, model: str, dim: int, host: str | None, api_key: str | None):
+    from lightrag.utils import wrap_embedding_func_with_attrs
+
+    if binding == "openai":
+        from lightrag.llm.openai import openai_embed
+
+        _kw: dict = {"model": model}
+        if host:
+            _kw["base_url"] = host
+        if api_key:
+            _kw["api_key"] = api_key
+
+        @wrap_embedding_func_with_attrs(embedding_dim=dim, max_token_size=8192)
+        async def _embed(texts):
+            return await openai_embed.func(texts, **_kw)
+        return _embed
+
+    if binding == "ollama":
+        from lightrag.llm.ollama import ollama_embedding
+        _host = host or "http://localhost:11434"
+
+        @wrap_embedding_func_with_attrs(embedding_dim=dim, max_token_size=8192)
+        async def _embed(texts):
+            return await ollama_embedding(texts, embed_model=model, host=_host)
+        return _embed
+
+    raise RuntimeError(
+        f"Unsupported EMBEDDING_BINDING={binding!r}. "
+        "Supported: openai, ollama"
+    )
