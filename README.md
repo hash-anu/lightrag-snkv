@@ -1,6 +1,6 @@
 # lightrag-snkv
 
-A storage backend for [LightRAG](https://github.com/HKUDS/LightRAG) built on embedded SQLite.
+A storage backend for [LightRAG](https://github.com/HKUDS/LightRAG) built on [SNKV](https://github.com/hash-anu/snkv)
 
 ---
 
