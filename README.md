@@ -35,29 +35,33 @@ You do not rewrite your application. The full LightRAG API — `ainsert`, `aquer
 
 ### Install
 
+Clone the repository and install in editable mode:
+
 ```bash
-pip install lightrag-snkv[vector]
+git clone https://github.com/hash-anu/lightrag-snkv.git
+cd lightrag-snkv
+pip install -e ".[vector]"
 ```
 
-This installs `lightrag-hku` (the full LightRAG framework), `snkv` (the storage engine), and this adapter package.
+This installs all dependencies: `lightrag-hku` (the full LightRAG framework) and `snkv` (the storage engine).
 
 ### Use
+
+If you already have LightRAG set up, plug in SNKV by adding two things — one import and four constructor params. Everything else in your code stays the same.
 
 ```python
 import asyncio
 from lightrag import LightRAG, QueryParam
-from lightrag.llm.openai import gpt_4o_mini_complete, openai_embed
-from lightrag_snkv import register
+from lightrag_snkv import register          # ← add this import
 
-register()  # registers SNKV backends with LightRAG — call once at startup
+register()                                  # ← call once at startup
 
 async def main():
     rag = LightRAG(
         working_dir="./my_rag",
-        llm_model_func=gpt_4o_mini_complete,
-        embedding_func=openai_embed,
-        # these 4 lines are the only difference from default LightRAG:
-        kv_storage="SNKVKVStorage",
+        llm_model_func=your_llm_func,       # your existing LLM function — unchanged
+        embedding_func=your_embed_func,     # your existing embed function — unchanged
+        kv_storage="SNKVKVStorage",         # ← add these 4 lines
         vector_storage="SNKVVectorStorage",
         graph_storage="SNKVGraphStorage",
         doc_status_storage="SNKVDocStatusStorage",
@@ -66,7 +70,7 @@ async def main():
     await rag.initialize_storages()
 
     await rag.ainsert("Marie Curie discovered polonium and radium.")
-    await rag.ainsert(["Doc 1 text", "Doc 2 text"])  # batch insert works too
+    await rag.ainsert(["Doc 1 text", "Doc 2 text"])
 
     result = await rag.aquery("Who discovered radium?", param=QueryParam(mode="hybrid"))
     print(result)
@@ -117,7 +121,7 @@ rag = LightRAG(
     doc_status_storage="SNKVDocStatusStorage",
 )
 
-# ainsert / aquery / aquery — no other changes needed
+# ainsert / aquery / finalize_storages — no other changes needed
 ```
 
 ### All query modes work
@@ -139,10 +143,10 @@ from lightrag_snkv import register_with_lightrag
 
 rag = LightRAG(
     working_dir="./my_rag",
-    llm_model_func=...,
-    embedding_func=...,
+    llm_model_func=your_llm_func,
+    embedding_func=your_embed_func,
 )
-register_with_lightrag(rag)  # sets all 4 backends and calls register() in one step
+register_with_lightrag(rag)  # sets all 4 storage backends and calls register() in one step
 
 await rag.initialize_storages()
 ```
@@ -150,8 +154,8 @@ await rag.initialize_storages()
 ### Requirements
 
 - Python 3.10 or later
-- `lightrag-hku >= 1.4.0` — installed automatically
-- `snkv >= 0.7.0` — installed automatically
+- `lightrag-hku >= 1.4.0` — installed as a dependency
+- `snkv >= 0.7.0` — installed as a dependency
 
 ---
 
