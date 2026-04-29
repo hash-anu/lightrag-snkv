@@ -14,6 +14,7 @@ dependencies = [
     "lightrag-hku>=1.4.0",
     "snkv>=0.7.0",
     "numpy>=1.24",
+    "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]
@@ -21,7 +22,6 @@ vector = ["snkv[vector]>=0.7.0"]
 server = [
     "lightrag-hku[api]>=1.4.0",
     "uvicorn>=0.30",
-    "python-dotenv>=1.0",
 ]
 bench = [
     "snkv[vector]>=0.7.0",

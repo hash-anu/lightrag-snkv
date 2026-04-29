@@ -8,7 +8,7 @@ The .env file in this directory is loaded automatically.
 import os
 from dotenv import load_dotenv
 
-load_dotenv()  # load .env before anything else
+load_dotenv()  # load .env before any lightrag imports
 
 # Register SNKV backends with LightRAG's storage registry
 from lightrag_snkv import register
@@ -20,10 +20,7 @@ os.environ["LIGHTRAG_VECTOR_STORAGE"] = "SNKVVectorStorage"
 os.environ["LIGHTRAG_GRAPH_STORAGE"] = "SNKVGraphStorage"
 os.environ["LIGHTRAG_DOC_STATUS_STORAGE"] = "SNKVDocStatusStorage"
 
-import uvicorn
-from lightrag.api.lightrag_server import app
+from lightrag.api.lightrag_server import main
 
 if __name__ == "__main__":
-    host = os.environ.get("HOST", "0.0.0.0")
-    port = int(os.environ.get("PORT", "9621"))
-    uvicorn.run(app, host=host, port=port)
+    main()

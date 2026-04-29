@@ -21,9 +21,12 @@ bench/_bench_wd/
 bench/_results/
 bench/data/
 
-# LightRAG working directories created during tests
+# LightRAG working directories created during tests or server runs
 rag_storage/
 **/rag_storage/
+my_rag/
+inputs/
+lightrag.log
 
 # Environment / secrets
 .env

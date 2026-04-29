@@ -46,6 +46,9 @@ pip install -e ".[vector]"
 
 # Web UI + server
 pip install -e ".[vector,server]"
+
+# Copy and fill in your LLM / embedding credentials
+cp .env.example .env
 ```
 
 This installs all dependencies: `lightrag-hku` (the full LightRAG framework) and `snkv` (the storage engine). The `server` extra adds `uvicorn` and the LightRAG API server components needed to run the web UI.
@@ -94,66 +97,6 @@ my_rag/
 ├── snkv_vec.entities_vdb.usearch        # HNSW index (fast restart)
 ├── snkv_vec.relations_vdb.usearch
 └── snkv_vec.chunks_vdb.usearch
-```
-
-### Migrating from default LightRAG
-
-The diff is exactly five lines:
-
-```python
-# BEFORE
-from lightrag import LightRAG, QueryParam
-
-rag = LightRAG(
-    working_dir="./my_rag",
-    llm_model_func=llm_func,
-    embedding_func=embed_func,
-)
-
-# AFTER
-from lightrag import LightRAG, QueryParam
-from lightrag_snkv import register        # + add this
-
-register()                                # + add this
-
-rag = LightRAG(
-    working_dir="./my_rag",
-    llm_model_func=llm_func,
-    embedding_func=embed_func,
-    kv_storage="SNKVKVStorage",           # + add these 4
-    vector_storage="SNKVVectorStorage",
-    graph_storage="SNKVGraphStorage",
-    doc_status_storage="SNKVDocStatusStorage",
-)
-
-# ainsert / aquery / finalize_storages — no other changes needed
-```
-
-### All query modes work
-
-```python
-from lightrag import QueryParam
-
-for mode in ["local", "global", "hybrid", "naive", "mix"]:
-    result = await rag.aquery("Your question", param=QueryParam(mode=mode))
-```
-
-### Convenience helper
-
-If you prefer a one-liner over passing four class names manually:
-
-```python
-from lightrag import LightRAG
-from lightrag_snkv import register_with_lightrag
-
-rag = LightRAG(
-    working_dir="./my_rag",
-    llm_model_func=your_llm_func,
-    embedding_func=your_embed_func,
-)
-register_with_lightrag(rag)  # sets all 4 storage backends and calls register() in one step
-
-await rag.initialize_storages()
 ```
 
 ### Web UI
