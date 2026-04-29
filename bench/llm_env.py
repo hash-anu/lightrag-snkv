@@ -5,8 +5,8 @@ which calls argparse at module import time and crashes under pytest/bench argv.
 
 Supported bindings
 ------------------
-LLM_BINDING      : openai (default), openai-ollama, ollama
-EMBEDDING_BINDING: openai (default), ollama
+LLM_BINDING      : openai (default), openai-ollama, azure_openai, ollama
+EMBEDDING_BINDING: openai (default), azure_openai, ollama
 
 Environment variables
 ---------------------
@@ -20,6 +20,11 @@ EMBEDDING_DIM            vector dimension (default: 1536)
 EMBEDDING_BINDING_HOST   optional base URL override
 EMBEDDING_BINDING_API_KEY API key (falls back to OPENAI_API_KEY)
 OPENAI_API_KEY           standard OpenAI key — fallback for both sides
+
+Azure-specific variables (when LLM_BINDING=azure_openai)
+---------------------------------------------------------
+AZURE_OPENAI_API_VERSION   API version (default: 2024-08-01-preview)
+AZURE_OPENAI_DEPLOYMENT    deployment name override (falls back to LLM_MODEL)
 """
 from __future__ import annotations
 
@@ -46,15 +51,13 @@ def get_llm_and_embed_funcs():
                      os.environ.get("OPENAI_API_KEY"))           or None
 
     # Fail fast — better than a cryptic 401 deep in the call stack.
-    if llm_binding in ("openai", "openai-ollama") and not llm_api_key and not llm_host:
+    if llm_binding in ("openai", "openai-ollama", "azure_openai") and not llm_api_key and not llm_host:
         raise MissingCredentialsError(
-            "OpenAI LLM needs OPENAI_API_KEY or LLM_BINDING_API_KEY. "
-            "Add the secret to GitHub → Settings → Secrets → Actions."
+            f"{llm_binding} LLM needs OPENAI_API_KEY or LLM_BINDING_API_KEY."
         )
-    if embed_binding == "openai" and not embed_api_key and not embed_host:
+    if embed_binding in ("openai", "azure_openai") and not embed_api_key and not embed_host:
         raise MissingCredentialsError(
-            "OpenAI embedding needs OPENAI_API_KEY or EMBEDDING_BINDING_API_KEY. "
-            "Add the secret to GitHub → Settings → Secrets → Actions."
+            f"{embed_binding} embedding needs OPENAI_API_KEY or EMBEDDING_BINDING_API_KEY."
         )
 
     llm_func   = _make_llm(llm_binding, llm_model, llm_host, llm_api_key)
@@ -85,6 +88,35 @@ def _make_llm(binding: str, model: str, host: str | None, api_key: str | None):
             )
         return _llm
 
+    if binding == "azure_openai":
+        from lightrag.llm.openai import openai_complete_if_cache
+
+        api_version = (
+            os.environ.get("AZURE_OPENAI_API_VERSION") or
+            os.environ.get("OPENAI_API_VERSION") or
+            "2024-08-01-preview"
+        )
+        deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT") or model
+
+        _kw: dict = {
+            "use_azure": True,
+            "azure_deployment": deployment,
+            "api_version": api_version,
+        }
+        if host:
+            _kw["base_url"] = host
+        if api_key:
+            _kw["api_key"] = api_key
+
+        async def _llm(prompt, system_prompt=None, history_messages=[], **kw):
+            return await openai_complete_if_cache(
+                deployment, prompt,
+                system_prompt=system_prompt,
+                history_messages=history_messages,
+                **_kw, **kw,
+            )
+        return _llm
+
     if binding == "ollama":
         from lightrag.llm.ollama import ollama_model_complete
         _host = host or "http://localhost:11434"
@@ -100,7 +132,7 @@ def _make_llm(binding: str, model: str, host: str | None, api_key: str | None):
 
     raise RuntimeError(
         f"Unsupported LLM_BINDING={binding!r}. "
-        "Supported: openai, openai-ollama, ollama"
+        "Supported: openai, openai-ollama, azure_openai, ollama"
     )
 
 
@@ -111,6 +143,33 @@ def _make_embed(binding: str, model: str, dim: int, host: str | None, api_key: s
         from lightrag.llm.openai import openai_embed
 
         _kw: dict = {"model": model}
+        if host:
+            _kw["base_url"] = host
+        if api_key:
+            _kw["api_key"] = api_key
+
+        @wrap_embedding_func_with_attrs(embedding_dim=dim, max_token_size=8192)
+        async def _embed(texts):
+            return await openai_embed.func(texts, **_kw)
+        return _embed
+
+    if binding == "azure_openai":
+        from lightrag.llm.openai import openai_embed
+
+        api_version = (
+            os.environ.get("AZURE_EMBEDDING_API_VERSION") or
+            os.environ.get("AZURE_OPENAI_API_VERSION") or
+            os.environ.get("OPENAI_API_VERSION") or
+            "2024-08-01-preview"
+        )
+        deployment = os.environ.get("AZURE_EMBEDDING_DEPLOYMENT") or model
+
+        _kw: dict = {
+            "model": deployment,
+            "use_azure": True,
+            "azure_deployment": deployment,
+            "api_version": api_version,
+        }
         if host:
             _kw["base_url"] = host
         if api_key:
@@ -132,5 +191,5 @@ def _make_embed(binding: str, model: str, dim: int, host: str | None, api_key: s
 
     raise RuntimeError(
         f"Unsupported EMBEDDING_BINDING={binding!r}. "
-        "Supported: openai, ollama"
+        "Supported: openai, azure_openai, ollama"
     )

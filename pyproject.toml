@@ -18,6 +18,11 @@ dependencies = [
 
 [project.optional-dependencies]
 vector = ["snkv[vector]>=0.7.0"]
+server = [
+    "lightrag-hku[api]>=1.4.0",
+    "uvicorn>=0.30",
+    "python-dotenv>=1.0",
+]
 bench = [
     "snkv[vector]>=0.7.0",
     "pandas>=2.0",
@@ -29,7 +34,7 @@ test = [
     "pytest-timeout>=2.0",
 ]
 all = [
-    "lightrag-snkv[vector,bench,test]",
+    "lightrag-snkv[vector,server,bench,test]",
 ]
 
 [project.scripts]

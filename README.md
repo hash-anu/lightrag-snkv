@@ -40,10 +40,15 @@ Clone the repository and install in editable mode:
 ```bash
 git clone https://github.com/hash-anu/lightrag-snkv.git
 cd lightrag-snkv
+
+# Programmatic use only
 pip install -e ".[vector]"
+
+# Web UI + server
+pip install -e ".[vector,server]"
 ```
 
-This installs all dependencies: `lightrag-hku` (the full LightRAG framework) and `snkv` (the storage engine).
+This installs all dependencies: `lightrag-hku` (the full LightRAG framework) and `snkv` (the storage engine). The `server` extra adds `uvicorn` and the LightRAG API server components needed to run the web UI.
 
 ### Use
 
@@ -151,6 +156,18 @@ register_with_lightrag(rag)  # sets all 4 storage backends and calls register() 
 await rag.initialize_storages()
 ```
 
+### Web UI
+
+LightRAG ships a full web interface. To run it with SNKV as the storage backend, use the included `server.py` instead of the standard `lightrag-server` command — it registers SNKV before the server starts:
+
+```bash
+python server.py
+```
+
+Then open `http://localhost:9621` in your browser.
+
+`server.py` loads your `.env` automatically and overrides the storage settings to use SNKV. The host and port are read from `HOST` and `PORT` in your `.env` (defaulting to `0.0.0.0:9621`).
+
 ### Reusing your existing LightRAG `.env`
 
 If you already run the LightRAG server and have a `.env` configured, you can reuse it directly — no need to rewire your LLM or embedding setup.
@@ -169,7 +186,7 @@ from dotenv import load_dotenv
 from lightrag import LightRAG, QueryParam
 from lightrag_snkv import register, get_llm_and_embed_funcs
 
-load_dotenv("/path/to/your/lightrag/.env")   # load your existing LightRAG .env
+load_dotenv()  # loads .env from the current directory (or pass a path: load_dotenv("/path/to/.env"))
 
 llm_func, embed_func = get_llm_and_embed_funcs()  # reads LLM_BINDING, LLM_MODEL, EMBEDDING_BINDING, etc.
 
@@ -198,15 +215,18 @@ asyncio.run(main())
 
 | Variable | Purpose |
 |---|---|
-| `LLM_BINDING` | LLM backend — `openai`, `ollama` |
+| `LLM_BINDING` | LLM backend — `openai`, `azure_openai`, `ollama` |
 | `LLM_MODEL` | Model name (e.g. `gpt-4o-mini`) |
 | `LLM_BINDING_HOST` | Custom endpoint (optional) |
 | `LLM_BINDING_API_KEY` | API key (falls back to `OPENAI_API_KEY`) |
-| `EMBEDDING_BINDING` | Embedding backend — `openai`, `ollama` |
+| `EMBEDDING_BINDING` | Embedding backend — `openai`, `azure_openai`, `ollama` |
 | `EMBEDDING_MODEL` | Embedding model name |
 | `EMBEDDING_DIM` | Vector dimension (default: 1536) |
 | `EMBEDDING_BINDING_HOST` | Custom endpoint (optional) |
 | `EMBEDDING_BINDING_API_KEY` | API key (falls back to `OPENAI_API_KEY`) |
+| `AZURE_OPENAI_API_VERSION` | Azure API version (default: `2024-08-01-preview`) |
+| `AZURE_OPENAI_DEPLOYMENT` | Azure deployment name override (falls back to `LLM_MODEL`) |
+| `AZURE_EMBEDDING_DEPLOYMENT` | Azure embedding deployment name (falls back to `EMBEDDING_MODEL`) |
 
 ### Requirements
 
