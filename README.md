@@ -8,7 +8,7 @@ A storage backend for [LightRAG](https://github.com/HKUDS/LightRAG) built on [SN
 
 LightRAG is a framework that builds a knowledge graph from your documents and uses it to answer questions. Out of the box it stores everything in a mix of JSON files and a binary pickle file — one file per namespace, scattered across your working directory.
 
-`lightrag-snkv` swaps those files for two embedded SQLite databases. Everything LightRAG does — inserting documents, building the graph, searching vectors, tracking document status — still works exactly the same way. You change four lines of configuration; nothing else in your code changes.
+`lightrag-snkv` swaps those files for two embedded SNKV databases. Everything LightRAG does — inserting documents, building the graph, searching vectors, tracking document status — still works exactly the same way. You change four lines of configuration; nothing else in your code changes.
 
 ---
 
@@ -18,7 +18,7 @@ LightRAG is a framework that builds a knowledge graph from your documents and us
 Default LightRAG creates a growing collection of JSON and pickle files. SNKV collapses all of that into two files: `snkv.db` and `snkv_vec.db`. Easier to back up, move, and reason about.
 
 **Safe writes.**
-Every multi-step write (graph update, vector upsert, batch delete) runs inside a single SQLite transaction. Either the whole operation commits or nothing changes. The default backend has no such guarantee — a crash mid-write can leave your data in an inconsistent state.
+Every multi-step write (graph update, vector upsert, batch delete) runs inside a single SNKV transaction. Either the whole operation commits or nothing changes. The default backend has no such guarantee — a crash mid-write can leave your data in an inconsistent state.
 
 **Fast restarts.**
 The default LightRAG uses a NetworkX pickle for graph storage that must be fully deserialized on startup, and a custom numpy index for vectors that must be rebuilt from scratch. SNKV saves the HNSW vector index to a sidecar file and validates it with a stamp on open — if it matches, the index loads in milliseconds rather than being rebuilt entry by entry.
