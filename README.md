@@ -151,6 +151,63 @@ register_with_lightrag(rag)  # sets all 4 storage backends and calls register() 
 await rag.initialize_storages()
 ```
 
+### Reusing your existing LightRAG `.env`
+
+If you already run the LightRAG server and have a `.env` configured, you can reuse it directly — no need to rewire your LLM or embedding setup.
+
+Install `python-dotenv` if you don't have it:
+
+```bash
+pip install python-dotenv
+```
+
+Then load your `.env` before building the `LightRAG` instance:
+
+```python
+import asyncio
+from dotenv import load_dotenv
+from lightrag import LightRAG, QueryParam
+from lightrag_snkv import register, get_llm_and_embed_funcs
+
+load_dotenv("/path/to/your/lightrag/.env")   # load your existing LightRAG .env
+
+llm_func, embed_func = get_llm_and_embed_funcs()  # reads LLM_BINDING, LLM_MODEL, EMBEDDING_BINDING, etc.
+
+register()
+
+async def main():
+    rag = LightRAG(
+        working_dir="./my_rag",
+        llm_model_func=llm_func,
+        embedding_func=embed_func,
+        kv_storage="SNKVKVStorage",
+        vector_storage="SNKVVectorStorage",
+        graph_storage="SNKVGraphStorage",
+        doc_status_storage="SNKVDocStatusStorage",
+    )
+
+    await rag.initialize_storages()
+    result = await rag.aquery("Your question", param=QueryParam(mode="hybrid"))
+    print(result)
+    await rag.finalize_storages()
+
+asyncio.run(main())
+```
+
+`get_llm_and_embed_funcs()` reads the same environment variables that the LightRAG server uses:
+
+| Variable | Purpose |
+|---|---|
+| `LLM_BINDING` | LLM backend — `openai`, `ollama` |
+| `LLM_MODEL` | Model name (e.g. `gpt-4o-mini`) |
+| `LLM_BINDING_HOST` | Custom endpoint (optional) |
+| `LLM_BINDING_API_KEY` | API key (falls back to `OPENAI_API_KEY`) |
+| `EMBEDDING_BINDING` | Embedding backend — `openai`, `ollama` |
+| `EMBEDDING_MODEL` | Embedding model name |
+| `EMBEDDING_DIM` | Vector dimension (default: 1536) |
+| `EMBEDDING_BINDING_HOST` | Custom endpoint (optional) |
+| `EMBEDDING_BINDING_API_KEY` | API key (falls back to `OPENAI_API_KEY`) |
+
 ### Requirements
 
 - Python 3.10 or later
