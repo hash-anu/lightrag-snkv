@@ -1,42 +1,47 @@
-# lightrag-snkv [WIP]
+# lightrag-snkv
 
-**Drop-in SNKV storage backend for [LightRAG](https://github.com/HKUDS/LightRAG).**
+A storage backend for [LightRAG](https://github.com/HKUDS/LightRAG) built on embedded SQLite.
 
-Replaces LightRAG's default file-based storage (JSON + NetworkX pickle) with two
-embedded SNKV files — no separate server, no network, no operational overhead.
+---
+
+## What is it?
+
+LightRAG is a framework that builds a knowledge graph from your documents and uses it to answer questions. Out of the box it stores everything in a mix of JSON files and a binary pickle file — one file per namespace, scattered across your working directory.
+
+`lightrag-snkv` swaps those files for two embedded SQLite databases. Everything LightRAG does — inserting documents, building the graph, searching vectors, tracking document status — still works exactly the same way. You change four lines of configuration; nothing else in your code changes.
+
+---
+
+## Why use it?
+
+**Fewer files, less mess.**
+Default LightRAG creates a growing collection of JSON and pickle files. SNKV collapses all of that into two files: `snkv.db` and `snkv_vec.db`. Easier to back up, move, and reason about.
+
+**Safe writes.**
+Every multi-step write (graph update, vector upsert, batch delete) runs inside a single SQLite transaction. Either the whole operation commits or nothing changes. The default backend has no such guarantee — a crash mid-write can leave your data in an inconsistent state.
+
+**Fast restarts.**
+The default LightRAG uses a NetworkX pickle for graph storage that must be fully deserialized on startup, and a custom numpy index for vectors that must be rebuilt from scratch. SNKV saves the HNSW vector index to a sidecar file and validates it with a stamp on open — if it matches, the index loads in milliseconds rather than being rebuilt entry by entry.
+
+**No external server.**
+Everything runs in-process. No Redis, no Postgres, no Qdrant to install, configure, or keep running. Just a file on disk.
+
+**Drop-in replacement.**
+You do not rewrite your application. The full LightRAG API — `ainsert`, `aquery`, `QueryParam`, all five query modes — works identically. The only change is four storage class names in the constructor.
+
+---
+
+## How to use it
+
+### Install
 
 ```bash
 pip install lightrag-snkv[vector]
 ```
 
----
+This installs `lightrag-hku` (the full LightRAG framework), `snkv` (the storage engine), and this adapter package.
 
-## What gets installed
-
-```
-pip install lightrag-snkv[vector]
-    │
-    ├── lightrag-hku      ← full LightRAG framework (HKUDS team)
-    ├── snkv              ← snkv + HNSW engine
-    ├── lightrag-snkv     ← this package (storage adapters only)
-    └── numpy
-```
-
-`lightrag-snkv` is a thin adapter layer. The LightRAG API you already know
-(`ainsert`, `aquery`, `QueryParam`, all query modes) works identically — you only
-change the storage backend.
-
----
-
-## Quickstart
-
-### Step 1 — Install
-
-```bash
-pip install lightrag-snkv[vector]
-```
-
-### Step 2 — Use
+### Use
 
 ```python
 import asyncio
@@ -44,7 +49,7 @@ from lightrag import LightRAG, QueryParam
 from lightrag.llm.openai import gpt_4o_mini_complete, openai_embed
 from lightrag_snkv import register
 
-register()  # one-time call — registers SNKV backends with LightRAG
+register()  # registers SNKV backends with LightRAG — call once at startup
 
 async def main():
     rag = LightRAG(
@@ -60,11 +65,9 @@ async def main():
 
     await rag.initialize_storages()
 
-    # Insert — same as always
     await rag.ainsert("Marie Curie discovered polonium and radium.")
-    await rag.ainsert(["Doc 1 text", "Doc 2 text"])   # batch insert
+    await rag.ainsert(["Doc 1 text", "Doc 2 text"])  # batch insert works too
 
-    # Query — all modes work identically
     result = await rag.aquery("Who discovered radium?", param=QueryParam(mode="hybrid"))
     print(result)
 
@@ -84,13 +87,51 @@ my_rag/
 └── snkv_vec.chunks_vdb.usearch
 ```
 
-Two `.db` files instead of dozens of JSON/pickle files.
+### Migrating from default LightRAG
 
----
+The diff is exactly five lines:
 
-## Convenience helper
+```python
+# BEFORE
+from lightrag import LightRAG, QueryParam
 
-If you prefer a one-liner over setting 4 storage names manually:
+rag = LightRAG(
+    working_dir="./my_rag",
+    llm_model_func=llm_func,
+    embedding_func=embed_func,
+)
+
+# AFTER
+from lightrag import LightRAG, QueryParam
+from lightrag_snkv import register        # + add this
+
+register()                                # + add this
+
+rag = LightRAG(
+    working_dir="./my_rag",
+    llm_model_func=llm_func,
+    embedding_func=embed_func,
+    kv_storage="SNKVKVStorage",           # + add these 4
+    vector_storage="SNKVVectorStorage",
+    graph_storage="SNKVGraphStorage",
+    doc_status_storage="SNKVDocStatusStorage",
+)
+
+# ainsert / aquery / aquery — no other changes needed
+```
+
+### All query modes work
+
+```python
+from lightrag import QueryParam
+
+for mode in ["local", "global", "hybrid", "naive", "mix"]:
+    result = await rag.aquery("Your question", param=QueryParam(mode=mode))
+```
+
+### Convenience helper
+
+If you prefer a one-liner over passing four class names manually:
 
 ```python
 from lightrag import LightRAG
@@ -101,148 +142,19 @@ rag = LightRAG(
     llm_model_func=...,
     embedding_func=...,
 )
-register_with_lightrag(rag)  # sets all 4 backends + registers in one call
+register_with_lightrag(rag)  # sets all 4 backends and calls register() in one step
 
 await rag.initialize_storages()
 ```
 
----
+### Requirements
 
-## Migrating from default LightRAG
-
-The only code change is adding `register()` and the 4 storage class names.
-Everything else stays the same:
-
-```python
-# BEFORE (default LightRAG)
-from lightrag import LightRAG, QueryParam
-
-rag = LightRAG(
-    working_dir="./my_rag",
-    llm_model_func=llm_func,
-    embedding_func=embed_func,
-)
-
-# AFTER (with SNKV)
-from lightrag import LightRAG, QueryParam
-from lightrag_snkv import register        # add this
-
-register()                                # add this
-
-rag = LightRAG(
-    working_dir="./my_rag",
-    llm_model_func=llm_func,
-    embedding_func=embed_func,
-    kv_storage="SNKVKVStorage",           # add these 4
-    vector_storage="SNKVVectorStorage",
-    graph_storage="SNKVGraphStorage",
-    doc_status_storage="SNKVDocStatusStorage",
-)
-
-# insert / query / delete — no changes needed
-```
-
----
-
-## All query modes work
-
-```python
-from lightrag import QueryParam
-
-for mode in ["local", "global", "hybrid", "naive", "mix"]:
-    result = await rag.aquery("Your question", param=QueryParam(mode=mode))
-```
-
----
-
-## Why SNKV over the default?
-
-| | Default LightRAG | lightrag-snkv |
-|---|---|---|
-| KV storage | JSON files | SNKV column family |
-| Vector search | Custom numpy | HNSW (usearch) |
-| Graph storage | NetworkX pickle | SNKV column family |
-| Doc status | JSON files | SNKV column family |
-| Files on disk | Many (one per namespace) | 2 `.db` files |
-| ACID transactions | No | Yes |
-| Fast restarts | Slow (pickle rebuild) | Yes (HNSW sidecar) |
-| External server | Not needed | Not needed |
-
-### Benchmark
-
-> i7-12700K · 32 GB RAM · SSD — A Christmas Carol corpus (64 chunks, 341 entities)
-> `only_need_context=True` isolates pure storage latency
-
-| Stack | Mean (ms) | p50 (ms) | p95 (ms) |
-|-------|-----------|----------|----------|
-| snkv  | 62.1      | 58.3     | 98.4     |
-| nano  | 71.4      | 67.2     | 115.6    |
-
-**1.15× faster at p50** · Results vary by hardware — run `bench/run_all.py` for your numbers.
-
----
-
-## Requirements
-
-- Python ≥ 3.10
-- `lightrag-hku >= 1.4.0` (installed automatically)
-- `snkv >= 0.7.0` (installed automatically)
-
----
-
-## Running Tests
-
-```bash
-# Clone the repo
-git clone https://github.com/your-username/lightrag-snkv.git
-cd lightrag-snkv
-pip install -e ".[vector,test]"
-
-# Unit + compatibility tests (no LLM needed — runs in ~2 seconds)
-pytest tests/ --ignore=tests/integration -v
-
-# Integration tests (requires LLM credentials)
-export OPENAI_API_KEY=sk-...
-LIGHTRAG_RUN_INTEGRATION=true pytest tests/integration/test_lightrag_snkv.py -v
-```
-
-The compatibility suite (`tests/compat/`) ports all 6 of LightRAG's own graph
-storage tests and runs them against `SNKVGraphStorage` — all pass.
-
----
-
-## Running Benchmarks
-
-```bash
-pip install -e ".[vector,bench]"
-
-# Storage-only benchmark (no LLM needed)
-python -m bench.run_all --stacks snkv nano --queries 20 --warmup 3 --context-only
-
-# Full end-to-end (requires LLM credentials)
-python -m bench.run_all --stacks snkv nano --queries 20 --warmup 5
-```
-
----
-
-## How it works
-
-```
-LightRAG                lightrag-snkv              snkv
-────────────────        ──────────────────         ──────────────────────
-BaseKVStorage      ←──  SNKVKVStorage         ──►  snkv.db (snkv CFs)
-BaseVectorStorage  ←──  SNKVVectorStorage     ──►  snkv_vec.db + usearch
-BaseGraphStorage   ←──  SNKVGraphStorage      ──►  snkv.db (snkv CFs)
-DocStatusStorage   ←──  SNKVDocStatusStorage  ──►  snkv.db (snkv CFs)
-```
-
-`lightrag-snkv` implements LightRAG's storage interfaces using SNKV as the
-engine. LightRAG never knows or cares that SNKV is underneath — it calls the
-same abstract methods it would call on any other backend.
+- Python 3.10 or later
+- `lightrag-hku >= 1.4.0` — installed automatically
+- `snkv >= 0.7.0` — installed automatically
 
 ---
 
 ## License
 
 Apache 2.0
-# lightrag-snkv
