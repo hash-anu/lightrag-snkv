@@ -15,6 +15,10 @@ Ask questions across thousands of Ask HN and Show HN posts — including every c
 ```bash
 pip install -e ".[vector,server,hn]"
 
+# Copy and fill in your LLM / embedding credentials
+cp .env.example .env
+# Required: set OPENAI_API_KEY (or your chosen LLM provider's key)
+
 # Backfill the last 4 weeks of HN discussions, then start the server
 python ingest_hn.py --lookback 4w
 python server.py
@@ -22,9 +26,9 @@ python server.py
 
 Open `http://localhost:9621` and ask:
 
-- *What problems are developers struggling with right now?*
-- *Which trending projects launched on Show HN this week?*
-- *What are people building with LLMs?*
+- *What are developers still doing manually in 2026 that should be automated?*
+- *Where does the HN community say AI helps vs where it fails developers?*
+- *What new open source tools on Show HN are exciting the community?*
 
 The knowledge graph captures not just what was posted but **what the community said about it**. Each post is ingested with its full comment tree, so the answers draw on real developer conversations.
 
