@@ -28,6 +28,10 @@ my_rag/
 inputs/
 lightrag.log
 
+# HN ingestion working directory and state
+hn_rag_storage/
+hn_state.json
+
 # Environment / secrets
 .env
 .env.*
