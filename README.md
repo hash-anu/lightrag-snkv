@@ -8,7 +8,9 @@ A storage backend for [LightRAG](https://github.com/HKUDS/LightRAG) built on [SN
 
 Ask questions across thousands of Ask HN and Show HN posts — including every comment thread — without leaving your terminal.
 
-<video src="https://github.com/user-attachments/assets/23a95319-ee66-49bc-811d-79fea94779b2" controls width="100%"></video>
+<p align="center">
+  <video src="https://github.com/user-attachments/assets/23a95319-ee66-49bc-811d-79fea94779b2" controls width="100%"></video>
+</p>
 
 ```bash
 pip install -e ".[vector,server,hn]"
