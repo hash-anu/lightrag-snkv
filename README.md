@@ -4,6 +4,32 @@ A storage backend for [LightRAG](https://github.com/HKUDS/LightRAG) built on [SN
 
 ---
 
+## Featured: Hacker News knowledge graph
+
+Ask questions across thousands of Ask HN and Show HN posts — including every comment thread — without leaving your terminal.
+
+```bash
+pip install -e ".[vector,server,hn]"
+
+# Backfill the last 4 weeks of HN discussions, then start the server
+python ingest_hn.py --lookback 4w
+python server.py
+```
+
+Open `http://localhost:9621` and ask:
+
+- *What problems are developers struggling with right now?*
+- *Which trending projects launched on Show HN this week?*
+- *What are people building with LLMs?*
+
+The knowledge graph captures not just what was posted but **what the community said about it**. Each post is ingested with its full comment tree, so the answers draw on real developer conversations.
+
+For continuous updates, set `HN_SCHEDULE=daily` in `.env` and run only `server.py` — the ingestion daemon runs inside the same process automatically.
+
+→ [Full HN ingestion docs](#hacker-news-ingestion)
+
+---
+
 ## What is it?
 
 LightRAG is a framework that builds a knowledge graph from your documents and uses it to answer questions. Out of the box it stores everything in a mix of JSON files and a binary pickle file — one file per namespace, scattered across your working directory.
@@ -211,6 +237,33 @@ hn_rag_storage/
 ├── snkv_vec.db                # post embeddings for semantic search
 ├── snkv_vec.*.usearch         # fast-restart vector index files
 └── hn_state.json              # tracks ingested posts and last run timestamp
+```
+
+#### Important: avoid running two processes on the same database
+
+Do **not** run `ingest_hn.py` and `server.py` pointing to the same `hn_rag_storage` directory at the same time. SQLite does not support concurrent writes from separate processes and will corrupt the database.
+
+Two safe approaches:
+
+**Option A — finish backfill first, then start server:**
+```bash
+# Step 1: run backfill to completion
+python ingest_hn.py --lookback 1w
+
+# Step 2: start server once ingestion is done
+python server.py
+```
+
+**Option B — integrated daemon (recommended for ongoing use):**
+Set `HN_SCHEDULE=daily` in `.env` and run only `server.py`. The ingestion daemon starts inside the same process, sharing the same database connection safely.
+
+```ini
+HN_SCHEDULE=daily
+WORKING_DIR=./hn_rag_storage
+```
+
+```bash
+python server.py   # serves + ingests in one process — no conflict
 ```
 
 #### What to ask
