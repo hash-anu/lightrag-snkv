@@ -67,6 +67,12 @@ You do not rewrite your application. The full LightRAG API — `ainsert`, `aquer
 
 ## How to use it
 
+### Requirements
+
+- Python 3.10 or later
+- `lightrag-hku >= 1.4.0` — installed as a dependency
+- `snkv >= 0.7.0` — installed as a dependency
+
 ### Install
 
 Clone the repository and install in editable mode:
@@ -145,148 +151,6 @@ Then open `http://localhost:9621` in your browser.
 
 `server.py` loads your `.env` automatically and overrides the storage settings to use SNKV. The host and port are read from `HOST` and `PORT` in your `.env` (defaulting to `0.0.0.0:9621`).
 
-### Hacker News Ingestion
-
-`lightrag-snkv` can automatically pull **Ask HN** and **Show HN** posts from Hacker News — including their full comment discussions — and build a searchable knowledge graph from them.
-
-Each ingested post becomes a rich document containing:
-- Post title, author, score, and date
-- Post body (if present)
-- All comments and replies (fetched from the HN Algolia items API)
-
-This means you can ask questions not just about what was posted, but what the community said about it.
-
-#### Install
-
-```bash
-pip install -e ".[vector,server,hn]"
-```
-
-#### Quick start — run once (backfill)
-
-```bash
-# Fetch last 1 week of Show HN + Ask HN posts (score ≥ 10), then exit
-python ingest_hn.py --lookback 1w
-
-# Show HN only
-python ingest_hn.py --lookback 1w --tags show_hn
-
-# For recent posts (< 3 days), lower min-score since new posts haven't accumulated upvotes yet
-python ingest_hn.py --lookback 2d --tags show_hn --min-score 3
-```
-
-#### Quick start — auto-ingest with the server
-
-Add these lines to your `.env`:
-
-```ini
-HN_SCHEDULE=daily          # fetch new posts every 24 hours automatically
-HN_LOOKBACK=1w             # on first run, go back 1 week
-HN_MIN_SCORE=10            # only keep posts with 10+ upvotes
-WORKING_DIR=./hn_rag_storage   # point server at HN knowledge graph
-```
-
-Then start the server:
-
-```bash
-python server.py
-```
-
-On first boot it backfills the past week of posts. Every 24 hours after that it fetches only new ones automatically in the background. Open `http://localhost:9621` to query the knowledge graph.
-
-#### Run manually (without the server)
-
-```bash
-# Fetch last 1 week, then exit
-python ingest_hn.py --lookback 1w
-
-# Fetch last 2 years, then exit
-python ingest_hn.py --lookback 2y
-
-# Show HN only, last 3 days
-python ingest_hn.py --lookback 3d --tags show_hn
-
-# Run as a daily daemon (keeps running forever, fetches new posts every 24h)
-python ingest_hn.py --schedule daily
-
-# Weekly daemon, high-quality posts only
-python ingest_hn.py --schedule weekly --min-score 50
-```
-
-#### Options
-
-| Option | `.env` variable | Default | What it does |
-|---|---|---|---|
-| `--lookback` | `HN_LOOKBACK` | `4w` | How far back to fetch on the **first run only**. After that, only new posts are fetched incrementally. Use `1y`, `2y`, `4w`, `3d`, `90d` etc. |
-| `--schedule` | `HN_SCHEDULE` | *(none)* | `daily` — fetch new posts every 24 hours. `weekly` — fetch every 7 days. Leave unset to run once and exit. When set in `.env`, the daemon starts automatically with `server.py`. |
-| `--min-score` | `HN_MIN_SCORE` | `10` | Only ingest posts with at least this many upvotes. For posts less than 3 days old, use `1`–`5` since they haven't had time to accumulate votes. |
-| `--tags` | `HN_TAGS` | `ask_hn,show_hn` | Which post types to fetch. `ask_hn` = Ask HN discussions. `show_hn` = Show HN project announcements. Pass one or both comma-separated. |
-| `--batch-size` | `HN_BATCH_SIZE` | `10` | How many posts are sent to the knowledge graph at once. Lower if you hit LLM rate limits. |
-| `--working-dir` | `HN_WORKING_DIR` | `./hn_rag_storage` | Where to store the HN knowledge graph. Kept separate from the main RAG storage. |
-
-#### How much data to expect
-
-| Lookback | Tags | Min score | Stories |
-|---|---|---|---|
-| 1 day | show_hn | 10 | ~5–15 |
-| 2 days | show_hn | 10 | ~13–30 |
-| 1 week | ask_hn + show_hn | 10 | ~900 |
-| 4 weeks | ask_hn + show_hn | 10 | ~4,000 |
-
-**Cost estimate (gpt-4o-mini):**
-- 1-week backfill: ~$1–2 one-time
-- Daily incremental runs: cents per day (LLM cache further reduces repeat costs)
-
-#### What gets stored
-
-```
-hn_rag_storage/
-├── snkv.db                    # knowledge graph + post metadata
-├── snkv_vec.db                # post embeddings for semantic search
-├── snkv_vec.*.usearch         # fast-restart vector index files
-└── hn_state.json              # tracks ingested posts and last run timestamp
-```
-
-#### Important: avoid running two processes on the same database
-
-Do **not** run `ingest_hn.py` and `server.py` pointing to the same `hn_rag_storage` directory at the same time. SQLite does not support concurrent writes from separate processes and will corrupt the database.
-
-Two safe approaches:
-
-**Option A — finish backfill first, then start server:**
-```bash
-# Step 1: run backfill to completion
-python ingest_hn.py --lookback 1w
-
-# Step 2: start server once ingestion is done
-python server.py
-```
-
-**Option B — integrated daemon (recommended for ongoing use):**
-Set `HN_SCHEDULE=daily` in `.env` and run only `server.py`. The ingestion daemon starts inside the same process, sharing the same database connection safely.
-
-```ini
-HN_SCHEDULE=daily
-WORKING_DIR=./hn_rag_storage
-```
-
-```bash
-python server.py   # serves + ingests in one process — no conflict
-```
-
-#### What to ask
-
-Once ingested, try questions like:
-
-- *What are the most talked about projects on Show HN this week?*
-- *What are developers asking about on Ask HN recently?*
-- *What are people building with AI/LLMs right now?*
-- *What new open source tools launched this week?*
-- *What problems are developers struggling with?*
-- *What did the community say about recent Show HN projects?*
-
----
-
 ### Reusing your existing LightRAG `.env`
 
 If you already run the LightRAG server and have a `.env` configured, you can reuse it directly — no need to rewire your LLM or embedding setup.
@@ -347,11 +211,146 @@ asyncio.run(main())
 | `AZURE_OPENAI_DEPLOYMENT` | Azure deployment name override (falls back to `LLM_MODEL`) |
 | `AZURE_EMBEDDING_DEPLOYMENT` | Azure embedding deployment name (falls back to `EMBEDDING_MODEL`) |
 
-### Requirements
+---
 
-- Python 3.10 or later
-- `lightrag-hku >= 1.4.0` — installed as a dependency
-- `snkv >= 0.7.0` — installed as a dependency
+## Hacker News Ingestion
+
+`lightrag-snkv` can automatically pull **Ask HN** and **Show HN** posts from Hacker News — including their full comment discussions — and build a searchable knowledge graph from them.
+
+Each ingested post becomes a rich document containing:
+- Post title, author, score, and date
+- Post body (if present)
+- All comments and replies (fetched from the HN Algolia items API)
+
+This means you can ask questions not just about what was posted, but what the community said about it.
+
+### Install
+
+```bash
+pip install -e ".[vector,server,hn]"
+```
+
+### Quick start — run once (backfill)
+
+```bash
+# Fetch last 1 week of Show HN + Ask HN posts (score ≥ 10), then exit
+python ingest_hn.py --lookback 1w
+
+# Show HN only
+python ingest_hn.py --lookback 1w --tags show_hn
+
+# For recent posts (< 3 days), lower min-score since new posts haven't accumulated upvotes yet
+python ingest_hn.py --lookback 2d --tags show_hn --min-score 3
+```
+
+### Quick start — auto-ingest with the server
+
+Add these lines to your `.env`:
+
+```ini
+HN_SCHEDULE=daily          # fetch new posts every 24 hours automatically
+HN_LOOKBACK=1w             # on first run, go back 1 week
+HN_MIN_SCORE=10            # only keep posts with 10+ upvotes
+WORKING_DIR=./hn_rag_storage   # point server at HN knowledge graph
+```
+
+Then start the server:
+
+```bash
+python server.py
+```
+
+On first boot it backfills the past week of posts. Every 24 hours after that it fetches only new ones automatically in the background. Open `http://localhost:9621` to query the knowledge graph.
+
+### Run manually (without the server)
+
+```bash
+# Fetch last 1 week, then exit
+python ingest_hn.py --lookback 1w
+
+# Fetch last 2 years, then exit
+python ingest_hn.py --lookback 2y
+
+# Show HN only, last 3 days
+python ingest_hn.py --lookback 3d --tags show_hn
+
+# Run as a daily daemon (keeps running forever, fetches new posts every 24h)
+python ingest_hn.py --schedule daily
+
+# Weekly daemon, high-quality posts only
+python ingest_hn.py --schedule weekly --min-score 50
+```
+
+### Options
+
+| Option | `.env` variable | Default | What it does |
+|---|---|---|---|
+| `--lookback` | `HN_LOOKBACK` | `4w` | How far back to fetch on the **first run only**. After that, only new posts are fetched incrementally. Use `1y`, `2y`, `4w`, `3d`, `90d` etc. |
+| `--schedule` | `HN_SCHEDULE` | *(none)* | `daily` — fetch new posts every 24 hours. `weekly` — fetch every 7 days. Leave unset to run once and exit. When set in `.env`, the daemon starts automatically with `server.py`. |
+| `--min-score` | `HN_MIN_SCORE` | `10` | Only ingest posts with at least this many upvotes. For posts less than 3 days old, use `1`–`5` since they haven't had time to accumulate votes. |
+| `--tags` | `HN_TAGS` | `ask_hn,show_hn` | Which post types to fetch. `ask_hn` = Ask HN discussions. `show_hn` = Show HN project announcements. Pass one or both comma-separated. |
+| `--batch-size` | `HN_BATCH_SIZE` | `10` | How many posts are sent to the knowledge graph at once. Lower if you hit LLM rate limits. |
+| `--working-dir` | `HN_WORKING_DIR` | `./hn_rag_storage` | Where to store the HN knowledge graph. Kept separate from the main RAG storage. |
+
+### How much data to expect
+
+| Lookback | Tags | Min score | Stories |
+|---|---|---|---|
+| 1 day | show_hn | 10 | ~5–15 |
+| 2 days | show_hn | 10 | ~13–30 |
+| 1 week | ask_hn + show_hn | 10 | ~900 |
+| 4 weeks | ask_hn + show_hn | 10 | ~4,000 |
+
+**Cost estimate (gpt-4o-mini):**
+- 1-week backfill: ~$1–2 one-time
+- Daily incremental runs: cents per day (LLM cache further reduces repeat costs)
+
+### What gets stored
+
+```
+hn_rag_storage/
+├── snkv.db                    # knowledge graph + post metadata
+├── snkv_vec.db                # post embeddings for semantic search
+├── snkv_vec.*.usearch         # fast-restart vector index files
+└── hn_state.json              # tracks ingested posts and last run timestamp
+```
+
+### Important: avoid running two processes on the same database
+
+Do **not** run `ingest_hn.py` and `server.py` pointing to the same `hn_rag_storage` directory at the same time. SNKV does not support concurrent writes from separate processes and will corrupt the database.
+
+Two safe approaches:
+
+**Option A — finish backfill first, then start server:**
+```bash
+# Step 1: run backfill to completion
+python ingest_hn.py --lookback 1w
+
+# Step 2: start server once ingestion is done
+python server.py
+```
+
+**Option B — integrated daemon (recommended for ongoing use):**
+Set `HN_SCHEDULE=daily` in `.env` and run only `server.py`. The ingestion daemon starts inside the same process, sharing the same database connection safely.
+
+```ini
+HN_SCHEDULE=daily
+WORKING_DIR=./hn_rag_storage
+```
+
+```bash
+python server.py   # serves + ingests in one process — no conflict
+```
+
+### What to ask
+
+Once ingested, try questions like:
+
+- *What are developers still doing manually in 2026 that should be automated?*
+- *Where does the HN community say AI helps vs where it fails developers?*
+- *What new open source tools on Show HN are exciting the community?*
+- *What problems are developers struggling with?*
+- *What did the community say about recent Show HN projects?*
 
 ---
 
