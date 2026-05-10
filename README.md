@@ -96,6 +96,7 @@ python ingest_hn.py --schedule weekly --min-score 50
 | `--working-dir` | `HN_WORKING_DIR` | `./hn_rag_storage` | Where to store the HN knowledge graph. Kept separate from the main RAG storage. |
 | *(n/a)* | `HN_SERVER_URL` | `http://localhost:9621` | URL of the running server. The daemon submits documents here so the WebUI shows progress. |
 | *(n/a)* | `HN_INTERVAL_SECONDS` | *(from schedule)* | Override the daemon sleep interval in seconds. Useful for testing — e.g. `60` to trigger every minute. Remove for production. |
+| *(n/a)* | `HN_SCHEDULE` | *(unset)* | Leave unset (or comment out) to disable HN ingestion entirely. The server starts normally with no daemon. |
 
 ### How much data to expect
 
