@@ -14,6 +14,8 @@ if TYPE_CHECKING:
     from lightrag import LightRAG
     from lightrag_snkv.hn_config import HNConfig
 
+_SERVER_URL = os.environ.get("HN_SERVER_URL", "http://localhost:9621")
+
 from lightrag_snkv.hn_config import parse_lookback
 from lightrag_snkv.hn_fetcher import build_document, fetch_item, iter_stories
 
@@ -147,7 +149,8 @@ class HNIngestor:
 
     async def run_daemon(self) -> None:
         """Loop forever, calling run_once() on the configured schedule."""
-        sleep_secs = _SCHEDULE_SECONDS.get(self._cfg.schedule or "", 86_400)
+        sleep_secs = int(os.environ.get("HN_INTERVAL_SECONDS") or
+                         _SCHEDULE_SECONDS.get(self._cfg.schedule or "", 86_400))
         logger.info("HN daemon started (schedule=%s, sleep=%ds)", self._cfg.schedule, sleep_secs)
 
         while True:
@@ -168,12 +171,17 @@ class HNIngestor:
         return since_ts, until_ts
 
     async def _flush(self, docs: list[str], ids: list[str]) -> int:
-        """Insert a batch into LightRAG, mark as ingested, persist state."""
+        """Insert a batch into LightRAG via the server API so the WebUI shows progress."""
         try:
-            await self._rag.ainsert(docs)
+            async with httpx.AsyncClient(timeout=300) as client:
+                resp = await client.post(
+                    f"{_SERVER_URL}/documents/texts",
+                    json={"texts": docs},
+                )
+                resp.raise_for_status()
         except Exception:
             logger.exception(
-                "ainsert() failed for batch of %d stories; will retry next run.", len(docs)
+                "POST /documents/texts failed for batch of %d stories; will retry next run.", len(docs)
             )
             return 0
 

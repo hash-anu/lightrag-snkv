@@ -36,7 +36,7 @@ Open `http://localhost:9621` and ask:
 
 ### Quick start — auto-ingest with the server
 
-Add these lines to your `.env` and run only `server.py` — the ingestion daemon starts inside the same process automatically:
+Add these lines to your `.env` and run only `server.py` — the ingestion daemon starts automatically in the background:
 
 ```ini
 HN_SCHEDULE=daily          # fetch new posts every 24 hours automatically
@@ -48,6 +48,22 @@ WORKING_DIR=./hn_rag_storage   # point server at HN knowledge graph
 ```bash
 python server.py
 ```
+
+The daemon submits each batch through the server's own API, so ingestion progress is visible in the WebUI document pipeline in real time.
+
+### Query modes
+
+Use **`global`** mode for broad trend and discussion questions — it traverses the full knowledge graph rather than anchoring on a specific entity:
+
+- *What are people discussing this week?* → `global`
+- *What problems are developers struggling with?* → `global`
+- *What did users say about project X?* → `local` or `hybrid`
+
+The WebUI mode dropdown defaults to `mix`. Switch it to `global` for HN-style questions.
+
+### Relative time queries
+
+`server.py` automatically injects today's date into every query so the LLM can interpret phrases like *"this week"*, *"recently"*, and *"today"* against the `Date:` field stored in each ingested post. No special syntax required.
 
 ### Run manually (without the server)
 
@@ -78,6 +94,8 @@ python ingest_hn.py --schedule weekly --min-score 50
 | `--tags` | `HN_TAGS` | `ask_hn,show_hn` | Which post types to fetch. `ask_hn` = Ask HN discussions. `show_hn` = Show HN project announcements. Pass one or both comma-separated. |
 | `--batch-size` | `HN_BATCH_SIZE` | `10` | How many posts are sent to the knowledge graph at once. Lower if you hit LLM rate limits. |
 | `--working-dir` | `HN_WORKING_DIR` | `./hn_rag_storage` | Where to store the HN knowledge graph. Kept separate from the main RAG storage. |
+| *(n/a)* | `HN_SERVER_URL` | `http://localhost:9621` | URL of the running server. The daemon submits documents here so the WebUI shows progress. |
+| *(n/a)* | `HN_INTERVAL_SECONDS` | *(from schedule)* | Override the daemon sleep interval in seconds. Useful for testing — e.g. `60` to trigger every minute. Remove for production. |
 
 ### How much data to expect
 
