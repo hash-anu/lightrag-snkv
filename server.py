@@ -5,18 +5,48 @@ Run from the lightrag-snkv directory:
 
 The .env file in this directory is loaded automatically.
 
-If HN_SCHEDULE is set in .env (daily or weekly), the Hacker News ingestion
-daemon starts automatically in the background alongside the web server.
+The Hacker News ingestion daemon does NOT start automatically, even if
+HN_SCHEDULE is set in .env. Pass --enable-hn to start it in the background
+alongside the web server:
+
+    python server.py --enable-hn
+
+Pass --enable-audio to also start the local audio-ingestion scanner, which
+watches AUDIO_SCAN_DIR (default ./audio_inputs) for audio files (mp3, m4a,
+webm, opus, wav, ogg, flac), transcribes them locally with faster-whisper,
+and ingests them automatically:
+
+    python server.py --enable-audio
 """
+import argparse
 import asyncio
 import datetime
 import json
 import logging
 import os
+import sys
 
 from dotenv import load_dotenv
 
 load_dotenv()  # load .env before any lightrag imports
+
+
+def _consume_own_args() -> tuple[bool, bool]:
+    """Parse our own flags out of sys.argv before lightrag's argparse sees it.
+
+    lightrag.api.lightrag_server parses sys.argv itself (strictly) the first
+    time its global_args is touched. Any flag we add here must be stripped
+    out first, or that later parse fails with "unrecognized arguments".
+    """
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--enable-hn", action="store_true", dest="enable_hn")
+    parser.add_argument("--enable-audio", action="store_true", dest="enable_audio")
+    known, remaining = parser.parse_known_args()
+    sys.argv = [sys.argv[0]] + remaining
+    return known.enable_hn, known.enable_audio
+
+
+_ENABLE_HN, _ENABLE_AUDIO = _consume_own_args()
 
 # Register SNKV backends with LightRAG's storage registry
 from lightrag_snkv import register
@@ -77,7 +107,12 @@ async def _run() -> None:
     tasks: list[asyncio.Task] = [asyncio.create_task(server.serve())]
 
     hn_schedule = os.environ.get("HN_SCHEDULE")
-    if hn_schedule:
+    if hn_schedule and not _ENABLE_HN:
+        logger.info(
+            "HN_SCHEDULE=%s is set but ingestion is disabled by default; "
+            "pass --enable-hn to start the daemon.", hn_schedule,
+        )
+    if hn_schedule and _ENABLE_HN:
         from lightrag import LightRAG
         from bench.llm_env import get_llm_and_embed_funcs
         from lightrag_snkv.hn_config import HNConfig
@@ -108,6 +143,17 @@ async def _run() -> None:
 
         tasks.append(asyncio.create_task(_hn_daemon()))
         logger.info("HN ingestion daemon started (schedule=%s).", hn_schedule)
+
+    if _ENABLE_AUDIO:
+        from lightrag_snkv.audio_config import AudioConfig
+        from lightrag_snkv.audio_ingestor import AudioIngestor
+
+        audio_cfg = AudioConfig()
+        os.makedirs(audio_cfg.scan_dir, exist_ok=True)
+
+        audio_ingestor = AudioIngestor(audio_cfg)
+        tasks.append(asyncio.create_task(audio_ingestor.run_daemon()))
+        logger.info("Audio ingestion scanner started (scan_dir=%s).", audio_cfg.scan_dir)
 
     await asyncio.gather(*tasks)
 
@@ -157,7 +203,7 @@ def main() -> None:
         asyncio.run(_run())
     except Exception as exc:
         logger.warning("Primary startup failed (%s); falling back to lightrag _main().", exc)
-        if os.environ.get("HN_SCHEDULE"):
+        if os.environ.get("HN_SCHEDULE") and _ENABLE_HN:
             _start_hn_daemon_thread()
         from lightrag.api.lightrag_server import main as _main
         _main()

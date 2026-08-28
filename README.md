@@ -136,6 +136,62 @@ Set `HN_SCHEDULE=daily` in `.env` and run only `server.py`. The ingestion daemon
 
 ---
 
+## Featured: local audio knowledge graph
+
+Drop any audio file into a folder and ask questions about it — the audio is transcribed **locally** with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (no cloud transcription calls, no external API, no ffmpeg required) and ingested automatically.
+
+This works on **any audio file you already have** — mp3, m4a, webm, opus, wav, ogg, flac — a lecture recording, a podcast episode, a meeting recording, a voice memo, whatever. It doesn't care where the file came from or what format it's in; faster-whisper decodes all of these directly.
+
+### Quick start
+
+```bash
+pip install -e ".[vector,server,audio]"
+
+cp .env.example .env
+# Required: set OPENAI_API_KEY (or your chosen LLM provider's key)
+
+# Start the server first
+python server.py
+```
+
+Then, in another terminal, drop an audio file into `./audio_inputs/` (or wherever `AUDIO_SCAN_DIR` points) and run:
+
+```bash
+python examples/ingest_audio.py
+```
+
+The first run downloads the `faster-whisper` model weights (one-time, size depends on `AUDIO_WHISPER_MODEL` — `base` is ~150MB) and transcribes every new audio file found, with `[MM:SS]` timestamps preserved in the stored transcript so answers can cite roughly when something was said.
+
+**Getting audio into the folder:** any means works — copy a file you already have, record one, or download audio from a URL with [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) (a general-purpose downloader supporting many sites, not just one platform):
+```bash
+yt-dlp -f bestaudio -o "audio_inputs/%(title)s.%(ext)s" "<URL>"
+```
+No ffmpeg needed for this — it saves the audio in its native format (e.g. `.webm`, `.m4a`), which the scanner picks up directly (see supported extensions below). Only use this against audio you have the rights to download.
+
+### Auto-scan with the server
+
+```bash
+python server.py --enable-audio
+```
+
+Starts a background scanner alongside the web server that re-checks `AUDIO_SCAN_DIR` on the configured schedule and ingests any new file it finds — just keep dropping audio files into the folder.
+
+### Options
+
+| Option | `.env` variable | Default | What it does |
+|---|---|---|---|
+| `--scan-dir` | `AUDIO_SCAN_DIR` | `./audio_inputs` | Directory scanned for audio files (`.mp3`, `.m4a`, `.webm`, `.opus`, `.wav`, `.ogg`, `.flac`). |
+| `--whisper-model` | `AUDIO_WHISPER_MODEL` | `base` | faster-whisper model size (`tiny`, `base`, `small`, `medium`, `large-v3`). Bigger = more accurate, slower, larger download. |
+| `--language` | `AUDIO_LANGUAGE` | *(auto-detect)* | Force a transcription language (e.g. `en`) instead of per-file auto-detection. |
+| `--device` | `AUDIO_DEVICE` | `cpu` | `cpu` or `cuda`. |
+| `--schedule` | `AUDIO_SCHEDULE` | *(none)* | `daily` / `weekly` daemon that re-scans the folder. Only takes effect with `server.py --enable-audio`, or run `examples/ingest_audio.py --schedule daily` standalone. |
+
+No ffmpeg required — `faster-whisper` decodes audio through a bundled library, not a system `ffmpeg` install.
+
+Dedup is against the server's own document storage (SNKV, via `doc_status.get_doc_by_file_path`) — no separate local state file. Each file is inserted individually (not batched), since a batch insert is rejected as a whole if any single item in it is a duplicate, which would otherwise silently drop other, genuinely-new files bundled in the same call.
+
+---
+
 ## What is it?
 
 LightRAG is a framework that builds a knowledge graph from your documents and uses it to answer questions. Out of the box it stores everything in a mix of JSON files and a binary pickle file — one file per namespace, scattered across your working directory.
