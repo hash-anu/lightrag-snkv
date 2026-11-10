@@ -1,4 +1,4 @@
-"""Unit tests for SNKVVectorStorage (12 test cases)."""
+"""Unit tests for SNKVVectorStorage."""
 from __future__ import annotations
 
 import numpy as np
@@ -163,4 +163,19 @@ async def test_upsert_overwrites_existing(global_config):
     await s.upsert({"e1": {"content": "updated", "entity_name": "NEW"}})
     result = await s.get_by_id("e1")
     assert result["entity_name"] == "NEW"
+    await s.finalize()
+
+
+@pytest.mark.asyncio
+async def test_batch_upserts_grow_index(global_config):
+    """Regression: a batch that pushes the usearch index past 90% of its
+    capacity must still insert (usearch's Index has no reserve())."""
+    s = await make_storage(global_config)
+    await s.upsert({f"a{i}": {"content": f"a {i}", "entity_name": f"A{i}"} for i in range(60)})
+    # 60 stored, capacity 128: adding 60 more crosses 90% (the case that crashed).
+    await s.upsert({f"b{i}": {"content": f"b {i}", "entity_name": f"B{i}"} for i in range(60)})
+    for i in range(40):
+        await s.upsert({f"c{i}": {"content": f"c {i}", "entity_name": f"C{i}"}})
+    assert len(s._index) == 160
+    assert len(await s.query("a 5", top_k=5)) == 5
     await s.finalize()
