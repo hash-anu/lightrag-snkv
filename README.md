@@ -55,7 +55,7 @@ pip install -e ".[vector,server]"
 cp .env.example .env
 ```
 
-Dependencies: `lightrag-hku >= 1.4.0` and `snkv >= 0.9.0`.
+Dependencies: `lightrag-hku >= 1.5.7` and `snkv >= 0.9.0`.
 
 ---
 
