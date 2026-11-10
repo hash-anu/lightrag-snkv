@@ -341,9 +341,7 @@ class SNKVVectorStorage(BaseVectorStorage):
 
             ids_arr  = np.array(list(new_ids.values()), dtype=np.uint64)
             vecs_arr = np.stack([emb.astype(np.float32) for emb in embeddings])
-            cap = self._index.capacity
-            if cap > 0 and (len(self._index) + len(ids_arr)) / cap >= 0.9:
-                self._index.reserve(max(cap * 2, len(self._index) + len(ids_arr) + 1))
+            # usearch's add() grows capacity on its own (Index has no reserve()).
             self._index.add(ids_arr, vecs_arr)
 
         await self._ex().run_in_executor(self._shared.executor, _batch_put)
