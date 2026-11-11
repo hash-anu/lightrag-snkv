@@ -2,7 +2,7 @@
 
 **Run [LightRAG](https://github.com/HKUDS/LightRAG) with zero extra databases.**
 
-`lightrag-snkv` is a storage backend for LightRAG built on the embedded [SNKV](https://github.com/hash-anu/snkv) database. It covers **all four** LightRAG storage types — KV, vector, graph, and document status — in two local files.
+`lightrag-snkv` is a storage backend for LightRAG built on the embedded [SNKV](https://github.com/hash-anu/snkv) database. It covers **all four** LightRAG storage types — KV, vector, graph, and document status — in a single folder of local files.
 
 No Postgres. No Neo4j. No Qdrant, Milvus, Redis, or MongoDB. No Docker. Just `pip install` and go.
 
@@ -15,7 +15,7 @@ A production LightRAG setup usually means running a separate service for each st
 | Storage type | Typical choice | With lightrag-snkv |
 |---|---|---|
 | KV storage | Redis / Postgres / MongoDB | `snkv.db` |
-| Vector storage | Qdrant / Milvus / pgvector | `snkv_vec.db` |
+| Vector storage | Qdrant / Milvus / pgvector | `snkv_vec_*.db` (SNKV native vector store) |
 | Graph storage | Neo4j / Memgraph / Postgres AGE | `snkv.db` |
 | Doc status storage | Postgres / MongoDB | `snkv.db` |
 | **Services to run** | 2–4 | **0** |
@@ -30,7 +30,7 @@ LightRAG's built-in default writes JSON files plus a NetworkX pickle. Every mult
 The HNSW vector index is saved to a sidecar file and checked on open. If it matches, it loads in milliseconds instead of being rebuilt entry by entry.
 
 **Easy to back up and move.**
-Your whole knowledge base is a folder with two database files. Copy it, ship it, version it.
+Your whole knowledge base is one folder of SNKV files. Copy it, ship it, version it.
 
 **Drop-in.**
 The full LightRAG API — `ainsert`, `aquery`, `QueryParam`, all query modes, the web UI — works unchanged. You change four storage class names.
@@ -97,10 +97,10 @@ asyncio.run(main())
 ```
 my_rag/
 ├── snkv.db                              # KV cache + graph + doc status
-├── snkv_vec.db                          # all embedding vectors
-├── snkv_vec.entities_vdb.usearch        # HNSW index (fast restart)
-├── snkv_vec.relations_vdb.usearch
-└── snkv_vec.chunks_vdb.usearch
+├── snkv_vec_entities.db                 # entity embeddings
+├── snkv_vec_relationships.db            # relationship embeddings
+├── snkv_vec_chunks.db                   # text chunk embeddings
+└── snkv_vec_*.db.usearch                # saved HNSW indexes (fast restart)
 ```
 
 ---
@@ -169,6 +169,7 @@ asyncio.run(main())
 
 ## Good to know
 
+- **Upgrading from an older version?** Vectors used to live in one shared `snkv_vec.db`. On first start, each namespace is copied into its new `snkv_vec_<namespace>.db` automatically. The old file is left untouched; delete it once everything looks right.
 - **One writer process per folder.** SNKV is embedded, so don't point two separate processes at the same `working_dir` at the same time. Inside a single process (including `server.py`) it's safe.
 - **Benchmarks.** `bench/` compares SNKV against LightRAG's default storage: `pip install -e ".[bench]"` then `lightrag-snkv-bench`.
 - **Tests.** `pip install -e ".[vector,test]"` then `pytest`.

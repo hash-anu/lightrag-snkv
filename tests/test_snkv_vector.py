@@ -168,14 +168,102 @@ async def test_upsert_overwrites_existing(global_config):
 
 @pytest.mark.asyncio
 async def test_batch_upserts_grow_index(global_config):
-    """Regression: a batch that pushes the usearch index past 90% of its
-    capacity must still insert (usearch's Index has no reserve())."""
+    """Many batch and single upserts must all land in the index as it grows."""
     s = await make_storage(global_config)
     await s.upsert({f"a{i}": {"content": f"a {i}", "entity_name": f"A{i}"} for i in range(60)})
     # 60 stored, capacity 128: adding 60 more crosses 90% (the case that crashed).
     await s.upsert({f"b{i}": {"content": f"b {i}", "entity_name": f"B{i}"} for i in range(60)})
     for i in range(40):
         await s.upsert({f"c{i}": {"content": f"c {i}", "entity_name": f"C{i}"}})
-    assert len(s._index) == 160
+    assert len(s._vs) == 160
     assert len(await s.query("a 5", top_k=5)) == 5
     await s.finalize()
+
+
+# ---------------------------------------------------------------------------
+# Native SNKV vector store (snkv >= 0.9): files, restart, reverse index, migration
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_one_file_per_namespace_and_survives_restart(global_config):
+    import os
+
+    s = await make_storage(global_config, namespace="entities")
+    await s.upsert({f"e{i}": {"content": f"item {i}", "entity_name": f"E{i}"} for i in range(20)})
+    before = await s.get_vectors_by_ids(["e3"])
+    await s.finalize()
+
+    wd = global_config["working_dir"]
+    assert os.path.exists(os.path.join(wd, "snkv_vec_entities.db"))
+    assert os.path.exists(os.path.join(wd, "snkv_vec_entities.db.usearch"))
+
+    s = await make_storage(global_config, namespace="entities")
+    assert (await s.get_by_id("e3"))["entity_name"] == "E3"
+    assert (await s.get_vectors_by_ids(["e3"]))["e3"] == before["e3"]
+    hits = await s.query("", top_k=1, query_embedding=before["e3"])
+    assert hits[0]["id"] == "e3" and hits[0]["distance"] == pytest.approx(1.0, abs=1e-4)
+    await s.finalize()
+
+
+@pytest.mark.asyncio
+async def test_reverse_index_after_partial_deletes_and_restart(global_config):
+    s = await make_storage(global_config, namespace="relationships")
+    await s.upsert({
+        "r1": {"content": "r", "src_id": "A", "tgt_id": "B"},
+        "r2": {"content": "r", "src_id": "B", "tgt_id": "C"},
+        "r3": {"content": "r", "src_id": "A", "tgt_id": "C"},
+    })
+    await s.delete(["r3"])  # plain delete must also clean A's and C's entries
+    await s.finalize()
+
+    s = await make_storage(global_config, namespace="relationships")
+    await s.delete_entity_relation("A")
+    assert await s.get_by_id("r1") is None
+    assert await s.get_by_id("r2") is not None
+    await s.delete_entity_relation("C")
+    assert await s.get_by_id("r2") is None
+    assert len(s._vs) == 0
+    await s.finalize()
+
+
+@pytest.mark.asyncio
+async def test_drop_then_reuse(global_config):
+    s = await make_storage(global_config)
+    await s.upsert({"e1": {"content": "x"}, "r1": {"content": "y", "src_id": "A", "tgt_id": "B"}})
+    assert (await s.drop())["status"] == "success"
+    assert len(s._vs) == 0
+    await s.delete_entity_relation("A")  # reverse index was dropped too
+    await s.upsert({"e2": {"content": "z"}})
+    assert await s.get_by_id("e2") is not None
+    await s.finalize()
+
+
+@pytest.mark.asyncio
+async def test_migrates_legacy_shared_file(global_config):
+    import json
+    import os
+    from snkv import KVStore
+
+    wd = global_config["working_dir"]
+    legacy = KVStore(os.path.join(wd, "snkv_vec.db"))
+    val_cf = legacy.create_column_family("vec_val_relationships")
+    raw_cf = legacy.create_column_family("vec_raw_relationships")
+    vec = np.zeros(EMBED_DIM, dtype=np.float32)
+    vec[0] = 1.0
+    for key, src, tgt in (("r1", "A", "B"), ("r2", "B", "C")):
+        payload = {"__created_at__": 1, "src_id": src, "tgt_id": tgt, "content": key}
+        val_cf.put(key.encode(), json.dumps(payload).encode())
+        raw_cf.put(key.encode(), vec.tobytes())
+    val_cf.close()
+    raw_cf.close()
+    legacy.close()
+
+    s = await make_storage(global_config, namespace="relationships")
+    assert (await s.get_by_id("r1"))["src_id"] == "A"
+    assert (await s.get_by_id("r1"))["created_at"] == 1
+    hits = await s.query("", top_k=2, query_embedding=vec.tolist())
+    assert {h["id"] for h in hits} == {"r1", "r2"}
+    await s.delete_entity_relation("B")  # reverse index was rebuilt
+    assert len(s._vs) == 0
+    await s.finalize()
+    assert os.path.exists(os.path.join(wd, "snkv_vec.db"))  # old file kept
