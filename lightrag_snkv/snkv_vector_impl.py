@@ -1,53 +1,59 @@
 """SNKV-backed BaseVectorStorage for LightRAG.
 
-All vector namespaces (entities, relationships, chunks) share one
-``snkv_vec.db`` file via snkv_shared.  Each namespace uses six
-namespace-prefixed column families and an in-memory usearch HNSW index.
-A ``snkv_vec.{namespace}.usearch`` sidecar is written on close to skip
-the O(n*d) rebuild on the next open.
+Built on SNKV's native vector store (``snkv.vector.VectorStore``): storage,
+the HNSW index and its ``.usearch`` sidecar are all handled by the SNKV C
+library, so no separate vector package is needed.
 
-No dependency on snkv.vector.VectorStore — usearch is managed directly.
+Each LightRAG vector namespace (entities, relationships, chunks) gets its own
+file, ``snkv_vec_{namespace}.db``, because one VectorStore holds one index.
+
+Stored per key:
+  value     JSON payload: ``__created_at__``, the namespace's meta fields, content
+  vector    float32 embedding, indexed for cosine search
+
+Reverse index (relationships namespace): plain KV entries
+``_REV_PREFIX + entity_name -> JSON list of relation keys`` in the same file,
+so deleting an entity's relations needs no full scan. Relation keys are hashes
+of their two entity names, so a key's entities never change. Entries are
+written before the vectors and cleaned after deletes; after a crash the index
+can hold extra keys (ignored on use) but never misses one.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import os
-import struct
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, final
 
 import numpy as np
-
-try:
-    from usearch.index import Index as UsearchIndex
-except ImportError as exc:
-    raise ImportError(
-        "usearch is required for SNKVVectorStorage.\n"
-        "Install with:  pip install snkv[vector]"
-    ) from exc
-
 from lightrag.base import BaseVectorStorage
 from lightrag.utils import compute_mdhash_id, logger
 from snkv import NotFoundError
+from snkv.vector import VectorStore
 
-from . import snkv_shared
-
-
-def _pack_i64(n: int) -> bytes:
-    return struct.pack(">q", n)
+_REV_PREFIX = b"\x00rev\x00"  # cannot collide with LightRAG ids (ent-/rel-/chunk- hashes)
+_MIGRATE_BATCH = 500
 
 
-def _unpack_i64(b: bytes) -> int:
-    return struct.unpack(">q", b)[0]
+def _rev_key(entity_name: str) -> bytes:
+    return _REV_PREFIX + entity_name.encode()
 
 
-def _get_or_create_cf(kv, name: str):
+def _decode_payload(raw: bytes | None) -> dict[str, Any] | None:
+    if raw is None:
+        return None
     try:
-        return kv.open_column_family(name)
-    except NotFoundError:
-        return kv.create_column_family(name)
+        return json.loads(raw.decode())
+    except (ValueError, UnicodeDecodeError):
+        return {}
+
+
+def _vector_files(db_path: str) -> list[str]:
+    return [db_path, f"{db_path}-wal", f"{db_path}-shm",
+            f"{db_path}.usearch", f"{db_path}.usearch.nid"]
 
 
 @final
@@ -74,143 +80,147 @@ class SNKVVectorStorage(BaseVectorStorage):
             self.final_namespace = self.namespace
 
         os.makedirs(db_dir, exist_ok=True)
-        self._db_path = os.path.join(db_dir, "snkv_vec.db")
-        self._sidecar_path = os.path.join(db_dir, f"snkv_vec.{self.namespace}.usearch")
+        self._db_dir = db_dir
+        self._db_path = os.path.join(db_dir, f"snkv_vec_{self.namespace}.db")
         self._dim = self.embedding_func.embedding_dim
         self._max_batch_size = self.global_config["embedding_batch_num"]
 
-        ns = self.namespace
-        self._cf_val_name  = f"vec_val_{ns}"   # key → JSON payload
-        self._cf_raw_name  = f"vec_raw_{ns}"   # key → float32 bytes
-        self._cf_idk_name  = f"vec_idk_{ns}"   # key → int64 usearch label
-        self._cf_idi_name  = f"vec_idi_{ns}"   # int64 → key
-        self._cf_meta_name = f"vec_meta_{ns}"  # config (next_id)
-        self._cf_rev_name  = f"vec_rev_{ns}"   # entity_name → JSON list of relation keys
+        self._vs: VectorStore | None = None
+        # One thread per storage: keeps reverse-index read-modify-writes ordered.
+        self._executor: ThreadPoolExecutor | None = None
 
-        self._shared: snkv_shared.SharedStore | None = None
-        self._val_cf  = None
-        self._raw_cf  = None
-        self._idk_cf  = None
-        self._idi_cf  = None
-        self._meta_cf = None
-        self._rev_cf  = None
-        self._index: UsearchIndex | None = None
-        self._next_id: int = 0
-
-    def _ex(self):
-        return asyncio.get_running_loop()
-
-    # ------------------------------------------------------------------
-    # Reverse-index helpers (sync, called on executor thread)
-    # ------------------------------------------------------------------
-
-    def _get_rev(self, entity_name: str) -> list[str]:
-        raw = self._rev_cf.get(entity_name.encode())
-        return json.loads(raw.decode()) if raw else []
-
-    def _write_rev_map(self, rev_map: dict[str, list[str]]) -> None:
-        """Write a pre-computed rev_map dict inside an open transaction."""
-        for entity_name, keys_list in rev_map.items():
-            if keys_list:
-                self._rev_cf.put(entity_name.encode(), json.dumps(keys_list).encode())
-            else:
-                try:
-                    self._rev_cf.delete(entity_name.encode())
-                except NotFoundError:
-                    pass
-
-    # ------------------------------------------------------------------
-    # Sync open/close (run on shared executor thread)
-    # ------------------------------------------------------------------
-
-    def _open_store(self) -> None:
-        kv = self._shared.kv
-        self._val_cf  = _get_or_create_cf(kv, self._cf_val_name)
-        self._raw_cf  = _get_or_create_cf(kv, self._cf_raw_name)
-        self._idk_cf  = _get_or_create_cf(kv, self._cf_idk_name)
-        self._idi_cf  = _get_or_create_cf(kv, self._cf_idi_name)
-        self._meta_cf = _get_or_create_cf(kv, self._cf_meta_name)
-        self._rev_cf  = _get_or_create_cf(kv, self._cf_rev_name)
-
-        stored_nid = self._meta_cf.get(b"next_id")
-        self._next_id = _unpack_i64(stored_nid) if stored_nid else 0
-
-        self._index = UsearchIndex(ndim=self._dim, metric="cos", dtype="f32")
-        self._index.expansion_search = 64
-
-        # Try sidecar fast-path
-        if os.path.exists(self._sidecar_path):
-            nid_path = self._sidecar_path + ".nid"
-            try:
-                with open(nid_path, "rb") as f:
-                    sidecar_nid = _unpack_i64(f.read(8))
-                if sidecar_nid == self._next_id:
-                    candidate = UsearchIndex.restore(self._sidecar_path)
-                    if candidate.ndim == self._dim:
-                        self._index = candidate
-                        self._index.expansion_search = 64
-                        return
-            except Exception:
-                pass
-            # Stale or corrupt — remove and fall through to rebuild
-            for p in (self._sidecar_path, nid_path):
-                try:
-                    os.unlink(p)
-                except OSError:
-                    pass
-
-        # Rebuild index from raw CF
-        if self._raw_cf.count() > 0:
-            ids: list[int] = []
-            vecs: list[np.ndarray] = []
-            with self._raw_cf.iterator() as it:
-                for key_b, vec_bytes in it:
-                    id_raw = self._idk_cf.get(key_b)
-                    if id_raw is not None:
-                        ids.append(_unpack_i64(id_raw))
-                        vecs.append(np.frombuffer(vec_bytes, dtype=np.float32))
-            if ids:
-                self._index.add(np.array(ids, dtype=np.uint64), np.stack(vecs))
-
-    def _close_store(self) -> None:
-        if self._index is not None and self._sidecar_path:
-            try:
-                self._index.save(self._sidecar_path)
-                with open(self._sidecar_path + ".nid", "wb") as f:
-                    f.write(_pack_i64(self._next_id))
-            except Exception:
-                for p in (self._sidecar_path, self._sidecar_path + ".nid"):
-                    try:
-                        os.unlink(p)
-                    except OSError:
-                        pass
-
-        for cf in (self._val_cf, self._raw_cf, self._idk_cf, self._idi_cf, self._meta_cf, self._rev_cf):
-            if cf is not None:
-                try:
-                    cf.close()
-                except Exception:
-                    pass
-        self._val_cf = self._raw_cf = self._idk_cf = self._idi_cf = self._meta_cf = self._rev_cf = None
-        self._index = None
+    async def _run(self, fn):
+        return await asyncio.get_running_loop().run_in_executor(self._executor, fn)
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
+    def _open_store(self) -> None:
+        is_new = not os.path.exists(self._db_path)
+        self._vs = VectorStore(
+            self._db_path, dim=self._dim, space="cosine", expansion_search=64
+        )
+        if is_new:
+            self._migrate_legacy()
+
     async def initialize(self) -> None:
-        self._shared = snkv_shared.acquire(self._db_path)
-        await self._ex().run_in_executor(self._shared.executor, self._open_store)
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=f"snkv_vec_{self.namespace}"
+        )
+        await self._run(self._open_store)
 
     async def finalize(self) -> None:
-        if self._shared is None:
+        if self._executor is None:
             return
-        await self._ex().run_in_executor(self._shared.executor, self._close_store)
-        snkv_shared.release(self._db_path)
-        self._shared = None
+
+        def _close():
+            if self._vs is not None:
+                self._vs.close()  # also saves the .usearch sidecar
+                self._vs = None
+
+        await self._run(_close)
+        self._executor.shutdown(wait=True)
+        self._executor = None
+
+    def _migrate_legacy(self) -> None:
+        """Copy this namespace out of the pre-0.2 shared ``snkv_vec.db``
+        (column families ``vec_val_{ns}`` / ``vec_raw_{ns}``), if present.
+        The old file is left untouched."""
+        legacy_path = os.path.join(self._db_dir, "snkv_vec.db")
+        if not os.path.exists(legacy_path):
+            return
+        from snkv import KVStore
+
+        val_name, raw_name = f"vec_val_{self.namespace}", f"vec_raw_{self.namespace}"
+        old = KVStore(legacy_path)
+        try:
+            if not {val_name, raw_name} <= set(old.list_column_families()):
+                return
+            val_cf = old.open_column_family(val_name)
+            raw_cf = old.open_column_family(raw_name)
+            batch: list[tuple[bytes, bytes, np.ndarray]] = []
+            rev: dict[str, list[str]] = {}
+            moved = 0
+            with val_cf.iterator() as it:
+                for key_b, val_b in it:
+                    vec_b = raw_cf.get(key_b)
+                    if vec_b is None:
+                        continue
+                    vec = np.frombuffer(vec_b, dtype=np.float32)
+                    if vec.shape[0] != self._dim:
+                        logger.warning(
+                            f"[{self.workspace}] Not migrating {self.namespace}: stored "
+                            f"vectors have {vec.shape[0]} dims, embedding model has {self._dim}"
+                        )
+                        return
+                    batch.append((key_b, bytes(val_b), vec))
+                    payload = _decode_payload(val_b) or {}
+                    for e in (payload.get("src_id"), payload.get("tgt_id")):
+                        if e:
+                            rev.setdefault(e, []).append(key_b.decode())
+                    if len(batch) >= _MIGRATE_BATCH:
+                        self._vs.vector_put_batch(batch)
+                        moved += len(batch)
+                        batch = []
+            if batch:
+                self._vs.vector_put_batch(batch)
+                moved += len(batch)
+            for entity, keys in rev.items():
+                self._vs[_rev_key(entity)] = json.dumps(keys).encode()
+            val_cf.close()
+            raw_cf.close()
+            logger.info(
+                f"[{self.workspace}] Migrated {moved} {self.namespace} vectors from "
+                f"snkv_vec.db to {os.path.basename(self._db_path)}"
+            )
+        finally:
+            old.close()
 
     # ------------------------------------------------------------------
-    # BaseVectorStorage abstract methods
+    # Reverse index helpers (executor thread)
+    # ------------------------------------------------------------------
+
+    def _get_rev(self, entity_name: str) -> list[str]:
+        raw = self._vs.get(_rev_key(entity_name))
+        return json.loads(raw.decode()) if raw else []
+
+    def _set_rev(self, entity_name: str, keys: list[str]) -> None:
+        if keys:
+            self._vs[_rev_key(entity_name)] = json.dumps(keys).encode()
+        else:
+            try:
+                del self._vs[_rev_key(entity_name)]
+            except NotFoundError:
+                pass
+
+    def _delete_keys(self, keys: list[str]) -> int:
+        """Delete vectors and drop them from their entities' reverse index."""
+        drop_from: dict[str, set[str]] = {}
+        deleted = 0
+        for key in keys:
+            key_b = key.encode()
+            payload = _decode_payload(self._vs.get(key_b))
+            if payload is None:
+                continue
+            for e in (payload.get("src_id"), payload.get("tgt_id")):
+                if e:
+                    drop_from.setdefault(e, set()).add(key)
+            try:
+                self._vs.delete(key_b)
+                deleted += 1
+            except NotFoundError:
+                pass
+        for entity, gone in drop_from.items():
+            self._set_rev(entity, [k for k in self._get_rev(entity) if k not in gone])
+        return deleted
+
+    @staticmethod
+    def _row(key: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return {"id": key, "created_at": payload.pop("__created_at__", None), **payload}
+
+    # ------------------------------------------------------------------
+    # BaseVectorStorage methods
     # ------------------------------------------------------------------
 
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
@@ -220,7 +230,6 @@ class SNKVVectorStorage(BaseVectorStorage):
         current_time = int(time.time())
         keys = list(data.keys())
         contents = [v["content"] for v in data.values()]
-
         batches = [
             contents[i : i + self._max_batch_size]
             for i in range(0, len(contents), self._max_batch_size)
@@ -235,118 +244,38 @@ class SNKVVectorStorage(BaseVectorStorage):
             )
             return
 
-        def _batch_put():
-            kv = self._shared.kv
-
-            # Pre-read phase — must happen before the transaction to avoid
-            # read-within-write isolation issues in SQLite.
-            pre_ids: dict[bytes, int | None] = {}
-            pre_entity_pairs: dict[bytes, tuple[str | None, str | None]] = {}
-
-            for key in keys:
-                key_b = key.encode()
-                old_raw = self._idk_cf.get(key_b)
-                pre_ids[key_b] = _unpack_i64(old_raw) if old_raw is not None else None
-
-                old_val_b = self._val_cf.get(key_b)
-                if old_val_b is not None:
-                    try:
-                        old_val = json.loads(old_val_b.decode())
-                        pre_entity_pairs[key_b] = (old_val.get("src_id"), old_val.get("tgt_id"))
-                    except Exception:
-                        pre_entity_pairs[key_b] = (None, None)
-                else:
-                    pre_entity_pairs[key_b] = (None, None)
-
-            # New src/tgt pairs from incoming data
-            new_entity_pairs: dict[bytes, tuple[str | None, str | None]] = {
-                key.encode(): (val.get("src_id"), val.get("tgt_id"))
-                for key, val in zip(keys, data.values())
-            }
-
-            # Collect all entity names that need reverse index changes
-            affected: set[str] = set()
-            for key_b in new_entity_pairs:
-                for e in (*pre_entity_pairs.get(key_b, (None, None)),
-                           *new_entity_pairs[key_b]):
+        def _put():
+            # Reverse index first, so a crash can only leave extra entries.
+            additions: dict[str, list[str]] = {}
+            for key, val in data.items():
+                for e in (val.get("src_id"), val.get("tgt_id")):
                     if e:
-                        affected.add(e)
+                        additions.setdefault(e, []).append(key)
+            for entity, new_keys in additions.items():
+                current = self._get_rev(entity)
+                merged = current + [k for k in dict.fromkeys(new_keys) if k not in current]
+                if len(merged) != len(current):
+                    self._set_rev(entity, merged)
 
-            # Pre-load all affected reverse index entries
-            rev_map: dict[str, list[str]] = {e: self._get_rev(e) for e in affected}
+            items = []
+            for key, val, emb in zip(keys, data.values(), embeddings):
+                stored = {
+                    "__created_at__": current_time,
+                    **{k: v for k, v in val.items() if k in self.meta_fields},
+                    "content": val.get("content", ""),
+                }
+                items.append((
+                    key.encode(),
+                    json.dumps(stored, ensure_ascii=False).encode(),
+                    np.asarray(emb, dtype=np.float32),
+                ))
+            self._vs.vector_put_batch(items)  # one transaction
 
-            # Apply changes in-memory
-            for key_b, (new_src, new_tgt) in new_entity_pairs.items():
-                key_str = key_b.decode()
-                old_src, old_tgt = pre_entity_pairs.get(key_b, (None, None))
+        await self._run(_put)
 
-                # Remove from old entities' rev lists
-                for old_e in (old_src, old_tgt):
-                    if old_e and old_e in rev_map:
-                        try:
-                            rev_map[old_e].remove(key_str)
-                        except ValueError:
-                            pass
-
-                # Add to new entities' rev lists (deduplicated)
-                for new_e in (new_src, new_tgt):
-                    if new_e:
-                        lst = rev_map.setdefault(new_e, [])
-                        if key_str not in lst:
-                            lst.append(key_str)
-
-            base_id = self._next_id
-            new_ids: dict[bytes, int] = {
-                key.encode(): base_id + i for i, key in enumerate(keys)
-            }
-
-            kv.begin(write=True)
-            try:
-                for key, val, emb in zip(keys, data.values(), embeddings):
-                    key_b = key.encode()
-                    new_id = new_ids[key_b]
-                    old_id = pre_ids[key_b]
-
-                    stored = {
-                        "__created_at__": current_time,
-                        **{k: v for k, v in val.items() if k in self.meta_fields},
-                        "content": val.get("content", ""),
-                    }
-                    self._val_cf.put(key_b, json.dumps(stored, ensure_ascii=False).encode())
-                    self._raw_cf.put(key_b, emb.astype(np.float32).tobytes())
-                    self._idk_cf.put(key_b, _pack_i64(new_id))
-                    self._idi_cf.put(_pack_i64(new_id), key_b)
-                    if old_id is not None:
-                        try:
-                            self._idi_cf.delete(_pack_i64(old_id))
-                        except NotFoundError:
-                            pass
-
-                self._write_rev_map(rev_map)
-                self._next_id = base_id + len(keys)
-                self._meta_cf.put(b"next_id", _pack_i64(self._next_id))
-                kv.commit()
-            except Exception:
-                self._next_id = base_id
-                kv.rollback()
-                raise
-
-            # Post-commit: update usearch index
-            for key_b, old_id in pre_ids.items():
-                if old_id is not None:
-                    try:
-                        self._index.remove(old_id)
-                    except Exception:
-                        pass
-
-            ids_arr  = np.array(list(new_ids.values()), dtype=np.uint64)
-            vecs_arr = np.stack([emb.astype(np.float32) for emb in embeddings])
-            # usearch's add() grows capacity on its own (Index has no reserve()).
-            self._index.add(ids_arr, vecs_arr)
-
-        await self._ex().run_in_executor(self._shared.executor, _batch_put)
-
-    async def query(self, query: str, top_k: int, query_embedding: list[float] = None) -> list[dict[str, Any]]:
+    async def query(
+        self, query: str, top_k: int, query_embedding: list[float] = None
+    ) -> list[dict[str, Any]]:
         if query_embedding is not None:
             q_vec = np.asarray(query_embedding, dtype=np.float32)
         else:
@@ -356,291 +285,89 @@ class SNKVVectorStorage(BaseVectorStorage):
         max_dist = 1.0 - self.cosine_better_than_threshold
 
         def _search():
-            if self._index is None or len(self._index) == 0:
+            if len(self._vs) == 0:
                 return []
-
-            matches = self._index.search(q_vec.reshape(1, -1), top_k)
-            labels  = np.asarray(matches.keys).ravel()
-            dists   = np.asarray(matches.distances).ravel()
-
             out = []
-            for label, dist in zip(labels, dists):
-                if dist > max_dist:
-                    continue
-                key_b = self._idi_cf.get(_pack_i64(int(label)))
-                if key_b is None:
-                    continue
-                val_b = self._val_cf.get(key_b)
-                if val_b is None:
-                    continue
-                try:
-                    val = json.loads(val_b.decode())
-                except Exception:
-                    val = {}
-                out.append({
-                    "id": key_b.decode(),
-                    "distance": 1.0 - dist,
-                    "created_at": val.pop("__created_at__", None),
-                    **val,
-                })
+            for r in self._vs.search(q_vec, top_k=top_k, max_distance=max_dist):
+                payload = _decode_payload(r.value) or {}
+                row = self._row(r.key.decode(), payload)
+                row["distance"] = 1.0 - r.distance  # LightRAG expects similarity
+                out.append(row)
             return out
 
-        return await self._ex().run_in_executor(self._shared.executor, _search)
+        return await self._run(_search)
 
     async def get_by_id(self, id: str) -> dict[str, Any] | None:
         def _get():
-            raw = self._val_cf.get(id.encode())
-            if raw is None:
-                return None
-            val = json.loads(raw.decode())
-            return {"id": id, "created_at": val.pop("__created_at__", None), **val}
+            payload = _decode_payload(self._vs.get(id.encode()))
+            return None if payload is None else self._row(id, payload)
 
-        return await self._ex().run_in_executor(self._shared.executor, _get)
+        return await self._run(_get)
 
     async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any] | None]:
         def _get_many():
             out: list[dict[str, Any] | None] = []
             for id_str in ids:
-                raw = self._val_cf.get(id_str.encode())
-                if raw is None:
-                    out.append(None)
-                else:
-                    val = json.loads(raw.decode())
-                    out.append({"id": id_str, "created_at": val.pop("__created_at__", None), **val})
+                payload = _decode_payload(self._vs.get(id_str.encode()))
+                out.append(None if payload is None else self._row(id_str, payload))
             return out
 
-        return await self._ex().run_in_executor(self._shared.executor, _get_many)
-
-    async def delete(self, ids: list[str]) -> None:
-        if not ids:
-            return
-
-        def _delete():
-            # Pre-read phase
-            pre_data: list[tuple[bytes, int, str | None, str | None]] = []
-            for id_str in ids:
-                key_b = id_str.encode()
-                id_raw = self._idk_cf.get(key_b)
-                if id_raw is None:
-                    continue
-                int_id = _unpack_i64(id_raw)
-                src_id = tgt_id = None
-                val_b = self._val_cf.get(key_b)
-                if val_b is not None:
-                    try:
-                        val = json.loads(val_b.decode())
-                        src_id = val.get("src_id")
-                        tgt_id = val.get("tgt_id")
-                    except Exception:
-                        pass
-                pre_data.append((key_b, int_id, src_id, tgt_id))
-
-            if not pre_data:
-                return
-
-            # Pre-load reverse index for affected entities
-            affected: set[str] = set()
-            for _, _, src, tgt in pre_data:
-                if src:
-                    affected.add(src)
-                if tgt:
-                    affected.add(tgt)
-            rev_map: dict[str, list[str]] = {e: self._get_rev(e) for e in affected}
-
-            # Apply removals in-memory
-            for key_b, _, src, tgt in pre_data:
-                key_str = key_b.decode()
-                for e in (src, tgt):
-                    if e and e in rev_map:
-                        try:
-                            rev_map[e].remove(key_str)
-                        except ValueError:
-                            pass
-
-            # Single transaction for all deletes + reverse index updates
-            self._shared.kv.begin(write=True)
-            try:
-                for key_b, int_id, _, _ in pre_data:
-                    for cf in (self._val_cf, self._raw_cf, self._idk_cf):
-                        try:
-                            cf.delete(key_b)
-                        except NotFoundError:
-                            pass
-                    try:
-                        self._idi_cf.delete(_pack_i64(int_id))
-                    except NotFoundError:
-                        pass
-                self._write_rev_map(rev_map)
-                self._shared.kv.commit()
-            except Exception:
-                self._shared.kv.rollback()
-                raise
-
-            # Post-commit: remove from usearch
-            for _, int_id, _, _ in pre_data:
-                try:
-                    self._index.remove(int_id)
-                except Exception:
-                    pass
-
-        await self._ex().run_in_executor(self._shared.executor, _delete)
-
-    async def delete_entity(self, entity_name: str) -> None:
-        entity_id = compute_mdhash_id(entity_name, prefix="ent-")
-
-        def _delete():
-            key_b = entity_id.encode()
-            id_raw = self._idk_cf.get(key_b)
-            if id_raw is None:
-                return
-            int_id = _unpack_i64(id_raw)
-            self._shared.kv.begin(write=True)
-            try:
-                for cf in (self._val_cf, self._raw_cf, self._idk_cf):
-                    try:
-                        cf.delete(key_b)
-                    except NotFoundError:
-                        pass
-                try:
-                    self._idi_cf.delete(_pack_i64(int_id))
-                except NotFoundError:
-                    pass
-                self._shared.kv.commit()
-            except Exception:
-                self._shared.kv.rollback()
-                raise
-            try:
-                self._index.remove(int_id)
-            except Exception:
-                pass
-
-        await self._ex().run_in_executor(self._shared.executor, _delete)
-
-    async def delete_entity_relation(self, entity_name: str) -> None:
-        def _delete_relations():
-            # O(1) lookup via reverse index instead of O(n) full scan
-            keys_to_delete = self._get_rev(entity_name)
-            if not keys_to_delete:
-                return
-
-            # Pre-read int_ids and cross-entity pairs
-            pre_data: list[tuple[bytes, int, str | None, str | None]] = []
-            for key_str in keys_to_delete:
-                key_b = key_str.encode()
-                id_raw = self._idk_cf.get(key_b)
-                if id_raw is None:
-                    continue
-                int_id = _unpack_i64(id_raw)
-                src_id = tgt_id = None
-                val_b = self._val_cf.get(key_b)
-                if val_b is not None:
-                    try:
-                        val = json.loads(val_b.decode())
-                        src_id = val.get("src_id")
-                        tgt_id = val.get("tgt_id")
-                    except Exception:
-                        pass
-                pre_data.append((key_b, int_id, src_id, tgt_id))
-
-            if not pre_data:
-                # Stale reverse index entry — clean it up
-                self._shared.kv.begin(write=True)
-                try:
-                    try:
-                        self._rev_cf.delete(entity_name.encode())
-                    except NotFoundError:
-                        pass
-                    self._shared.kv.commit()
-                except Exception:
-                    self._shared.kv.rollback()
-                return
-
-            # Pre-load reverse index for ALL affected entities (including entity_name
-            # itself and any other entities that share these relation keys)
-            affected: set[str] = set()
-            for _, _, src, tgt in pre_data:
-                if src:
-                    affected.add(src)
-                if tgt:
-                    affected.add(tgt)
-            rev_map: dict[str, list[str]] = {e: self._get_rev(e) for e in affected}
-
-            # Apply removals in-memory
-            for key_b, _, src, tgt in pre_data:
-                key_str = key_b.decode()
-                for e in (src, tgt):
-                    if e and e in rev_map:
-                        try:
-                            rev_map[e].remove(key_str)
-                        except ValueError:
-                            pass
-
-            # Single transaction: delete vectors + update all reverse indices
-            self._shared.kv.begin(write=True)
-            try:
-                for key_b, int_id, _, _ in pre_data:
-                    for cf in (self._val_cf, self._raw_cf, self._idk_cf):
-                        try:
-                            cf.delete(key_b)
-                        except NotFoundError:
-                            pass
-                    try:
-                        self._idi_cf.delete(_pack_i64(int_id))
-                    except NotFoundError:
-                        pass
-                self._write_rev_map(rev_map)
-                self._shared.kv.commit()
-            except Exception:
-                self._shared.kv.rollback()
-                raise
-
-            # Post-commit: remove from usearch
-            for _, int_id, _, _ in pre_data:
-                try:
-                    self._index.remove(int_id)
-                except Exception:
-                    pass
-
-            logger.debug(
-                f"[{self.workspace}] deleted {len(pre_data)} relations for {entity_name}"
-            )
-
-        await self._ex().run_in_executor(self._shared.executor, _delete_relations)
+        return await self._run(_get_many)
 
     async def get_vectors_by_ids(self, ids: list[str]) -> dict[str, list[float]]:
         def _get_vecs():
             out: dict[str, list[float]] = {}
             for id_str in ids:
-                raw = self._raw_cf.get(id_str.encode())
-                if raw is not None:
-                    out[id_str] = np.frombuffer(raw, dtype=np.float32).tolist()
+                try:
+                    out[id_str] = self._vs.vector_get(id_str.encode()).tolist()
+                except NotFoundError:
+                    pass
             return out
 
-        return await self._ex().run_in_executor(self._shared.executor, _get_vecs)
+        return await self._run(_get_vecs)
+
+    async def delete(self, ids: list[str]) -> None:
+        if ids:
+            await self._run(lambda: self._delete_keys(list(ids)))
+
+    async def delete_entity(self, entity_name: str) -> None:
+        entity_id = compute_mdhash_id(entity_name, prefix="ent-")
+        await self._run(lambda: self._delete_keys([entity_id]))
+
+    async def delete_entity_relation(self, entity_name: str) -> None:
+        def _delete_relations():
+            keys = self._get_rev(entity_name)
+            if not keys:
+                return
+            deleted = self._delete_keys(keys)
+            self._set_rev(entity_name, [])  # also clears keys that were already gone
+            logger.debug(
+                f"[{self.workspace}] deleted {deleted} relations for {entity_name}"
+            )
+
+        await self._run(_delete_relations)
 
     async def index_done_callback(self) -> None:
-        def _sync():
-            self._shared.kv.sync()
-
-        await self._ex().run_in_executor(self._shared.executor, _sync)
+        # Every write above commits its own transaction; the HNSW sidecar is
+        # saved on close and rebuilt from the database if it is ever stale.
+        return None
 
     async def drop(self) -> dict[str, str]:
         def _drop():
-            for cf in (self._val_cf, self._raw_cf, self._idk_cf, self._idi_cf,
-                       self._meta_cf, self._rev_cf):
-                if cf is not None:
-                    cf.clear()
-            self._next_id = 0
-            self._index = UsearchIndex(ndim=self._dim, metric="cos", dtype="f32")
-            self._index.expansion_search = 64
-            for p in (self._sidecar_path, self._sidecar_path + ".nid"):
+            if self._vs is not None:
+                self._vs.close()
+                self._vs = None
+            for p in _vector_files(self._db_path):
                 try:
                     os.unlink(p)
-                except OSError:
+                except FileNotFoundError:
                     pass
+            self._vs = VectorStore(
+                self._db_path, dim=self._dim, space="cosine", expansion_search=64
+            )
 
         try:
-            await self._ex().run_in_executor(self._shared.executor, _drop)
+            await self._run(_drop)
             return {"status": "success", "message": "data dropped"}
         except Exception as e:
             logger.error(f"[{self.workspace}] Error dropping {self.namespace}: {e}")
